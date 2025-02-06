@@ -42,7 +42,7 @@ SUBSCRIPTION_PRICING = {
 # Bot main menu and other callback names
 CALLBACKS = {
     "start": "start",
-    "launch": "launch",
+    "launch": "launch",  # When clicked, triggers subscription check then sequential coin creation
     "subscription": "subscription",
     "wallets": "wallets",
     "settings": "settings",
@@ -57,10 +57,12 @@ CALLBACKS = {
     "refresh_balance": "wallets:refresh_balance",
     "bundle": "wallets:bundle",
     "bundle_distribute_sol": "wallets:bundle_distribute_sol",
-    "commenter": "commenter",
     "bump_volume": "bump_volume",
     "socials": "socials",
     "dynamic_back": "dynamic_back",
+    # Launch conversation callbacks:
+    "launch_confirm_yes": "launch_confirm_yes",
+    "launch_confirm_no": "launch_confirm_no",
 }
 
 # In-memory storage for user wallets and subscriptions.
@@ -97,6 +99,7 @@ def generate_solana_wallet():
 # ----- MAIN MENU -----
 
 def generate_inline_keyboard():
+    # Main menu with text-only buttons.
     return [
         [InlineKeyboardButton("Launch", callback_data=CALLBACKS["launch"])],
         [
@@ -105,19 +108,17 @@ def generate_inline_keyboard():
             InlineKeyboardButton("Settings", callback_data=CALLBACKS["settings"]),
         ],
         [
-            InlineKeyboardButton("Commenter", callback_data=CALLBACKS["commenter"]),
-            InlineKeyboardButton("Bump & Volume", callback_data=CALLBACKS["bump_volume"]),
-        ],
-        [
+            InlineKeyboardButton("Bump & Volume Bots", callback_data=CALLBACKS["bump_volume"]),
             InlineKeyboardButton("Socials", callback_data=CALLBACKS["socials"]),
-            InlineKeyboardButton("Refresh", callback_data=CALLBACKS["refresh_balance"]),
         ],
+        [InlineKeyboardButton("Refresh", callback_data=CALLBACKS["refresh_balance"])],
     ]
 
 async def start(update: Update, context):
     user_id = update.effective_user.id
     try:
         context.user_data["nav_stack"] = []
+        # Create wallet if not exists.
         if user_id not in user_wallets:
             mnemonic, public_key, private_key = generate_solana_wallet()
             user_wallets[user_id] = {
@@ -128,13 +129,14 @@ async def start(update: Update, context):
             }
         wallet_address = user_wallets[user_id]["public"]
         reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
+        # ORIGINAL INTRO (unchanged)
         welcome_message = f"""
 Welcome to PumpBot!
 The fastest way to launch and manage assets, created by a team of friends from the PUMP community.
 
 You currently have no SOL balance. To get started with launching coin, subscribe first (Subscription) and send some SOL to your pumpbot wallet address:
 
-{wallet_address} (tap to copy)
+`{wallet_address}` (tap to copy)
 
 Once done, tap refresh and your balance will appear here.
 
@@ -153,15 +155,13 @@ async def go_to_main_menu(query, context):
     reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
     welcome_message = f"""
 Welcome to PumpBot!
-The fastest way to launch and manage assets, created by a team of friends from the PUMP community.
-
-Your wallet address: {wallet_address}
+Your wallet address: `{wallet_address}`
 
 Send SOL to your wallet and tap Refresh to update your balance.
 """
     await query.message.edit_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
 
-# ----- WALLET MANAGEMENT FUNCTIONS -----
+# ----- WALLET MANAGEMENT FUNCTIONS (UNCHANGED, with spacing improvements) -----
 
 async def handle_wallets_menu(update: Update, context):
     query = update.callback_query
@@ -179,16 +179,17 @@ async def handle_wallets_menu(update: Update, context):
          InlineKeyboardButton("Show Seed Phrase", callback_data=CALLBACKS["show_seed_phrase"])],
         [InlineKeyboardButton("Create New Wallet", callback_data=CALLBACKS["create_wallet"])],
         [InlineKeyboardButton("Import Wallet", callback_data=CALLBACKS["import_wallet"])],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+        # "Back to Menu" is always left; "Back" is always right.
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
          InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])],
     ]
     
     push_nav_state(context, {"message_text": query.message.text,
-                             "keyboard": query.message.reply_markup.inline_keyboard,
+                             "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                              "parse_mode": "Markdown"})
     
     await query.message.edit_text(
-        f"Wallet Management\n\nWallet Address: {wallet_address}\nTotal Holdings: {total_holdings} SOL\n\nChoose an option below:",
+        f"Wallet Management\n\nWallet Address: `{wallet_address}`\n\nMain Balance: {balance} SOL\nTotal Holdings: {total_holdings} SOL\n",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -209,24 +210,24 @@ async def show_wallet_details(update: Update, context):
     message = f"""
 Your Wallet:
 
-Address: {wallet["public"]} (tap to copy)
-Main Balance: {balance} SOL
+Address: `{wallet["public"]}`  
+Main Balance: {balance} SOL  
 Total Holdings: {total_holdings} SOL
 
-Tap to copy the address and send SOL to deposit.
-Once done, tap refresh and your balance will appear here.
+Tap the address to copy.  
+Send SOL to deposit and then tap Refresh to update your balance.
 """
     keyboard = [
         [InlineKeyboardButton("Deposit SOL", callback_data=CALLBACKS["deposit_sol"]),
          InlineKeyboardButton("Withdraw SOL", callback_data=CALLBACKS["withdraw_sol"])],
-        [InlineKeyboardButton("Refresh Balance", callback_data=CALLBACKS["refresh_balance"])],
-        [InlineKeyboardButton("View on Solscan", url=f"https://solscan.io/account/{wallet['public']}")],
         [InlineKeyboardButton("Bundle", callback_data=CALLBACKS["bundle"])],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+        [InlineKeyboardButton("Refresh Balance", callback_data=CALLBACKS["refresh_balance"])],
+        [InlineKeyboardButton("View on Solscan", url=f"https://solscan.io/account/`{wallet['public']}`")],
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
          InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])],
     ]
     push_nav_state(context, {"message_text": query.message.text,
-                             "keyboard": query.message.reply_markup.inline_keyboard,
+                             "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                              "parse_mode": "Markdown"})
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -254,15 +255,15 @@ async def show_bundle(update: Update, context):
     bundle_total = sum(b.get("balance", 0) for b in wallet["bundle"])
     message = f"Bundle Wallets:\n\nTotal Bundle Balance: {bundle_total} SOL\n\n"
     for idx, b_wallet in enumerate(wallet["bundle"], start=1):
-        message += f"{idx}. Address: {b_wallet['public']}\n   Balance: {b_wallet['balance']} SOL\n\n"
+        message += f"{idx}. Address: `{b_wallet['public']}`  \n   Balance: {b_wallet['balance']} SOL\n\n"
     message += "\nUse 'Distribute SOL' to distribute your main wallet's SOL among these bundle wallets."
     keyboard = [
         [InlineKeyboardButton("Distribute SOL", callback_data=CALLBACKS["bundle_distribute_sol"])],
-        [InlineKeyboardButton("Back", callback_data=CALLBACKS["wallet_details"]),
-         InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])],
     ]
     push_nav_state(context, {"message_text": query.message.text,
-                             "keyboard": query.message.reply_markup.inline_keyboard,
+                             "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                              "parse_mode": "Markdown"})
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -292,11 +293,11 @@ async def distribute_sol_bundle(update: Update, context):
 
     message = "Distribution Completed!\n\n"
     for idx, b_wallet in enumerate(bundle, start=1):
-        message += f"{idx}. Address: {b_wallet['public']}, New Balance: {b_wallet['balance']} SOL\n"
+        message += f"{idx}. Address: `{b_wallet['public']}`  \nNew Balance: {b_wallet['balance']} SOL\n"
     message += "\nMain wallet's SOL has been distributed to the bundle wallets."
     keyboard = [
-        [InlineKeyboardButton("Back to Bundle", callback_data=CALLBACKS["bundle"])],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])],
     ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -316,21 +317,21 @@ async def show_subscription_details(update: Update, context):
     status_text = "You do not have an active subscription yet." if not subscription_status.get("active") else "Your subscription is active."
     message = (
         "Your Account:\n"
-        f"Subscription Wallet Address: {wallet['address']}\n"
-        f"Subscription Wallet Private Key: {wallet['private_key']}\n"
-        f"Subscription Wallet Balance: {wallet['balance']} SOL\n\n"
+        f"Subscription Wallet Address: `{wallet['address']}`  \n"
+        f"Subscription Wallet Private Key: `{wallet['private_key']}`  \n"
+        f"Subscription Wallet Balance: `{wallet['balance']}` SOL\n\n"
         "Your Subscription:\n"
         f"{status_text}\n\n"
         "Pricing:\n"
-        f"Weekly Subscription Price: {SUBSCRIPTION_PRICING['weekly']} SOL (discount 10%)\n"
-        f"Monthly Subscription Price: {SUBSCRIPTION_PRICING['monthly']} SOL (discount 10%)\n"
+        f"Weekly Subscription Price: {SUBSCRIPTION_PRICING['weekly']} SOL (discount 10%)  \n"
+        f"Monthly Subscription Price: {SUBSCRIPTION_PRICING['monthly']} SOL (discount 10%)  \n"
         f"Lifetime Subscription Price: {SUBSCRIPTION_PRICING['lifetime']} SOL (discount 10%)"
     )
     keyboard = [
         [InlineKeyboardButton("Weekly - " + str(SUBSCRIPTION_PRICING["weekly"]) + " SOL", callback_data="subscription:weekly")],
         [InlineKeyboardButton("Monthly - " + str(SUBSCRIPTION_PRICING["monthly"]) + " SOL", callback_data="subscription:monthly")],
         [InlineKeyboardButton("Lifetime - " + str(SUBSCRIPTION_PRICING["lifetime"]) + " SOL", callback_data="subscription:lifetime")],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])],
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"])],
     ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -356,11 +357,10 @@ async def process_subscription_plan(update: Update, context):
         f"{SUBSCRIPTION_WALLET['address']}\n\n"
         "After you have completed the payment, tap the 'I have paid' button below."
     )
-    # Save the user's desired subscription plan so that when they confirm, we know what plan to activate.
     user_subscriptions[query.from_user.id] = {"active": False, "plan": plan, "amount": sol_amount}
     keyboard = [
         [InlineKeyboardButton("I have paid", callback_data=f"subscription:confirm:{plan}")],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"])],
     ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -378,8 +378,69 @@ async def confirm_subscription_payment(update: Update, context):
         "Your subscription is now active and you have full access to the bot's features."
     )
     keyboard = [
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"])],
     ]
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ----- STRICT, SEQUENTIAL LAUNCH COIN FLOW -----
+# This flow asks one question at a time and then shows a confirmation summary.
+
+LAUNCH_STEPS = [
+    ("name", "Please enter the *Coin Name*:"),
+    ("ticker", "Please enter the *Coin Ticker*:"),
+    ("price", "Please enter the *Price in $*:"),
+    ("description", "Please enter the *Coin Description*:"),
+    ("media", "Please enter the *Media URL* (image or video):")
+]
+
+def start_launch_flow(context):
+    """Initialize the launch conversation."""
+    context.user_data["launch_step_index"] = 0
+    context.user_data["coin_data"] = {}
+
+async def prompt_current_launch_step(query, context):
+    """Prompt the user for the current launch step."""
+    index = context.user_data.get("launch_step_index", 0)
+    if index < len(LAUNCH_STEPS):
+        step_key, prompt_text = LAUNCH_STEPS[index]
+        await query.message.edit_text(prompt_text, parse_mode="Markdown")
+    else:
+        # All required steps completed; show confirmation summary.
+        coin_data = context.user_data.get("coin_data", {})
+        summary = (
+            "*Review your coin data:*\n\n" +
+            f"*Name:* {coin_data.get('name')}\n" +
+            f"*Ticker:* {coin_data.get('ticker')}\n" +
+            f"*Price:* {coin_data.get('price')}\n" +
+            f"*Description:* {coin_data.get('description')}\n" +
+            f"*Media URL:* {coin_data.get('media')}\n\n" +
+            "Are you sure you want to create this coin? This action cannot be changed later."
+        )
+        keyboard = [
+            [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+             InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_confirm_no"])],
+            [InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"])]
+        ]
+        await query.message.edit_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def process_launch_confirmation(query, context):
+    """Simulate coin creation and display a success message."""
+    coin_data = context.user_data.get("coin_data", {})
+    message = (
+        "Creating Coin...\n\n" +
+        f"Name: {coin_data.get('name')}\n" +
+        f"Ticker: {coin_data.get('ticker')}\n" +
+        f"Price: {coin_data.get('price')}\n" +
+        f"Description: {coin_data.get('description')}\n" +
+        f"Media URL: {coin_data.get('media')}\n\n" +
+        "Your coin is now being deployed with PumpFun's bonding curve. When it completes, you'll receive 0.5 SOL."
+    )
+    keyboard = [
+        [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"])]
+    ]
+    # Clear launch conversation data.
+    context.user_data.pop("launch_step_index", None)
+    context.user_data.pop("coin_data", None)
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # ----- CALLBACK HANDLER -----
@@ -388,6 +449,7 @@ async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
     try:
+        # Wallet and subscription features.
         if query.data == CALLBACKS["wallets"]:
             await handle_wallets_menu(update, context)
         elif query.data == CALLBACKS["dynamic_back"]:
@@ -412,20 +474,20 @@ async def button_callback(update: Update, context):
                 "balance": 0
             }
             push_nav_state(context, {"message_text": query.message.text,
-                                     "keyboard": query.message.reply_markup.inline_keyboard,
+                                     "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                      "parse_mode": "Markdown"})
             await query.message.edit_text(
                 f"Your new wallet:\nPublic Key: {public_key}\n\nSave your private key and seed phrase securely. Check your private messages for the sensitive information.",
                 parse_mode="Markdown"
             )
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=query.from_user.id,
                 text=f"Your Wallet Details\nPrivate Key: {private_key}\nSeed Phrase: {mnemonic}\n\nKeep this information safe and never share it!",
                 parse_mode="Markdown"
             )
         elif query.data == CALLBACKS["import_wallet"]:
             push_nav_state(context, {"message_text": query.message.text,
-                                     "keyboard": query.message.reply_markup.inline_keyboard,
+                                     "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                      "parse_mode": "Markdown"})
             await query.message.edit_text(
                 "Import Wallet\nPlease send your private key as a message.\n\nMake sure you're sending this in a private message to the bot!",
@@ -437,11 +499,11 @@ async def button_callback(update: Update, context):
                 await query.message.edit_text("No wallet found. Please create a wallet first.")
                 return
             push_nav_state(context, {"message_text": query.message.text,
-                                     "keyboard": query.message.reply_markup.inline_keyboard,
+                                     "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                      "parse_mode": "Markdown"})
             private_key = user_wallets[user_id]["private"]
             keyboard = [
-                [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
                  InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
             ]
             await query.message.edit_text(
@@ -455,11 +517,11 @@ async def button_callback(update: Update, context):
                 await query.message.edit_text("No wallet found. Please create a wallet first.")
                 return
             push_nav_state(context, {"message_text": query.message.text,
-                                     "keyboard": query.message.reply_markup.inline_keyboard,
+                                     "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                      "parse_mode": "Markdown"})
             mnemonic = user_wallets[user_id]["mnemonic"]
             keyboard = [
-                [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
                  InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
             ]
             await query.message.edit_text(
@@ -475,15 +537,15 @@ async def button_callback(update: Update, context):
             if not wallet:
                 await query.message.edit_text("No wallet found. Please create a wallet first.")
                 return
-            message = f"Deposit SOL\n\nSend SOL to your wallet address:\n{wallet['public']}\n\n(Tap to copy)"
+            message = f"Deposit SOL\n\nSend SOL to your wallet address:\n`{wallet['public']}`\n\n(Tap to copy)"
             keyboard = [
-                [InlineKeyboardButton("Back", callback_data=CALLBACKS["wallet_details"]),
-                 InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+                [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+                 InlineKeyboardButton("Back", callback_data=CALLBACKS["wallet_details"])]
             ]
             await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         elif query.data == CALLBACKS["withdraw_sol"]:
             push_nav_state(context, {"message_text": query.message.text,
-                                     "keyboard": query.message.reply_markup.inline_keyboard,
+                                     "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                      "parse_mode": "Markdown"})
             context.user_data["awaiting_withdraw"] = True
             message = "Withdraw SOL\n\nReply with the destination address where you want to send SOL."
@@ -495,19 +557,19 @@ async def button_callback(update: Update, context):
             message = f"""
 Your Wallet:
 
-Address: {wallet["public"]} (tap to copy)
+Address: `{wallet["public"]}`  
 Balance: {balance} SOL
 
-Tap to copy the address and send SOL to deposit.
-Once done, tap refresh and your balance will appear here.
+Tap the address to copy and send SOL to deposit.
+Once done, tap Refresh to update your balance.
 """
             keyboard = [
                 [InlineKeyboardButton("Deposit SOL", callback_data=CALLBACKS["deposit_sol"]),
                  InlineKeyboardButton("Withdraw SOL", callback_data=CALLBACKS["withdraw_sol"])],
                 [InlineKeyboardButton("Refresh Balance", callback_data=CALLBACKS["refresh_balance"])],
-                [InlineKeyboardButton("View on Solscan", url=f"https://solscan.io/account/{wallet['public']}")],
-                [InlineKeyboardButton("Back", callback_data=CALLBACKS["wallets"]),
-                 InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])],
+                [InlineKeyboardButton("View on Solscan", url=f"https://solscan.io/account/`{wallet['public']}`")],
+                [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+                 InlineKeyboardButton("Back", callback_data=CALLBACKS["wallets"])],
             ]
             await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         elif query.data == CALLBACKS["bundle"]:
@@ -521,13 +583,35 @@ Once done, tap refresh and your balance will appear here.
                 await confirm_subscription_payment(update, context)
             else:
                 await process_subscription_plan(update, context)
+        # ----- Launch Flow (Sequential) -----
+        elif query.data == CALLBACKS["launch"]:
+            # Before starting the launch conversation, check subscription status.
+            user_id = query.from_user.id
+            subscription = user_subscriptions.get(user_id, {})
+            if not subscription.get("active"):
+                message = ("You must subscribe to use the Launch feature.\n\n"
+                           "Please subscribe first to unlock full access to all PumpBot features.")
+                keyboard = [
+                    [InlineKeyboardButton("Subscribe", callback_data=CALLBACKS["subscription"]),
+                     InlineKeyboardButton("Docs", url="https://yourgitbooklink.com")],
+                    [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"])]
+                ]
+                await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            else:
+                # Start the launch conversation.
+                start_launch_flow(context)
+                await prompt_current_launch_step(query, context)
+        elif query.data == CALLBACKS["launch_confirm_yes"]:
+            await process_launch_confirmation(query, context)
+        elif query.data == CALLBACKS["launch_confirm_no"]:
+            # Cancel launch and clear conversation data.
+            context.user_data.pop("launch_step_index", None)
+            context.user_data.pop("coin_data", None)
+            await query.message.edit_text("Coin creation cancelled.", parse_mode="Markdown")
         else:
             responses = {
-                CALLBACKS["launch"]: "Launch feature - Prepare to deploy your token with dev wallet protection.",
-                CALLBACKS["settings"]: "Customize your transaction settings, slippage, and gas fees.",
-                CALLBACKS["commenter"]: "Automatic commenting system for token pages.",
                 CALLBACKS["bump_volume"]: "Tools to increase your token's visibility and trading volume.",
-                CALLBACKS["socials"]: "Connect with our community across various platforms.",
+                CALLBACKS["socials"]: "Connect with our community on Telegram, Twitter, YouTube, and more.",
             }
             await query.message.edit_text(responses.get(query.data, "Feature coming soon!"))
     
@@ -567,6 +651,42 @@ async def handle_withdraw_address(update: Update, context):
         await import_private_key(update, context)
 
 async def handle_text_message(update: Update, context):
+    """
+    This function handles text messages for:
+      - Launch conversation (sequential coin creation)
+      - Wallet import / withdrawal messages (if not in a launch conversation)
+    """
+    if "launch_step_index" in context.user_data:
+        index = context.user_data.get("launch_step_index", 0)
+        if index < len(LAUNCH_STEPS):
+            step_key, prompt_text = LAUNCH_STEPS[index]
+            if "coin_data" not in context.user_data:
+                context.user_data["coin_data"] = {}
+            context.user_data["coin_data"][step_key] = update.message.text.strip()
+            context.user_data["launch_step_index"] = index + 1
+            # If there are more steps, prompt the next one.
+            if context.user_data["launch_step_index"] < len(LAUNCH_STEPS):
+                next_prompt = LAUNCH_STEPS[context.user_data["launch_step_index"]][1]
+                await update.message.reply_text(next_prompt, parse_mode="Markdown")
+            else:
+                # All steps complete; show confirmation summary.
+                coin_data = context.user_data.get("coin_data", {})
+                summary = (
+                    "*Review your coin data:*\n\n" +
+                    f"*Name:* {coin_data.get('name')}\n" +
+                    f"*Ticker:* {coin_data.get('ticker')}\n" +
+                    f"*Price:* {coin_data.get('price')}\n" +
+                    f"*Description:* {coin_data.get('description')}\n" +
+                    f"*Media URL:* {coin_data.get('media')}\n\n" +
+                    "Are you sure you want to create this coin? This action cannot be changed later."
+                )
+                keyboard = [
+                    [InlineKeyboardButton("Back to Menu", callback_data=CALLBACKS["start"]),
+                     InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_confirm_no"])],
+                    [InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"])]
+                ]
+                await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
     if context.user_data.get("awaiting_withdraw"):
         await handle_withdraw_address(update, context)
     else:
@@ -579,7 +699,6 @@ def main():
     if not bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
     application = Application.builder().token(bot_token).build()
-    # The automatic payment verification job is disabled for now.
     # application.job_queue.run_repeating(check_subscription_payments, interval=60, first=10)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_callback))

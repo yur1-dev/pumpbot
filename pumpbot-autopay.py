@@ -37,9 +37,9 @@ SUBSCRIPTION_WALLET = {
 
 # Subscription pricing (SOL amounts without emojis)
 SUBSCRIPTION_PRICING = {
-    "weekly": 0.9,
-    "monthly": 3.15,
-    "lifetime": 13.5,
+    "weekly": 1,
+    "monthly": 2.5,
+    "lifetime": 8,
 }
 
 # Bot main menu and other callback names
