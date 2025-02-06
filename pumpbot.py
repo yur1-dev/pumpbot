@@ -34,9 +34,9 @@ SUBSCRIPTION_WALLET = {
 
 # Subscription pricing (SOL amounts)
 SUBSCRIPTION_PRICING = {
-    "weekly": 0.9,
-    "monthly": 3.15,
-    "lifetime": 13.5,
+    "weekly": 1,
+    "monthly": 3,
+    "lifetime": 8,
 }
 
 # Bot main menu and other callback names
@@ -323,9 +323,9 @@ async def show_subscription_details(update: Update, context):
         "Your Subscription:\n"
         f"{status_text}\n\n"
         "Pricing:\n"
-        f"Weekly Subscription Price: {SUBSCRIPTION_PRICING['weekly']} SOL (discount 10%)  \n"
-        f"Monthly Subscription Price: {SUBSCRIPTION_PRICING['monthly']} SOL (discount 10%)  \n"
-        f"Lifetime Subscription Price: {SUBSCRIPTION_PRICING['lifetime']} SOL (discount 10%)"
+        f"Weekly Subscription Price: {SUBSCRIPTION_PRICING['weekly']} SOL  \n"
+        f"Monthly Subscription Price: {SUBSCRIPTION_PRICING['monthly']} SOL \n"
+        f"Lifetime Subscription Price: {SUBSCRIPTION_PRICING['lifetime']} SOL "
     )
     keyboard = [
         [InlineKeyboardButton("Weekly - " + str(SUBSCRIPTION_PRICING["weekly"]) + " SOL", callback_data="subscription:weekly")],
