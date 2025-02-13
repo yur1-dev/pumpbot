@@ -66,10 +66,12 @@ CALLBACKS = {
     "show_seed_phrase": "wallets:show_seed_phrase",
     "create_wallet": "wallets:create_wallet",  # advanced option; will not overwrite if wallet exists
     "import_wallet": "wallets:import_wallet",
+    "cancel_import_wallet": "wallets:cancel_import_wallet",  # NEW: Cancel import wallet flow
     "back_to_wallets": "back_to_wallets",
     "wallet_details": "wallets:details",
     "deposit_sol": "wallets:deposit_sol",
     "withdraw_sol": "wallets:withdraw_sol",
+    "cancel_withdraw_sol": "wallets:cancel_withdraw_sol",  # NEW: Cancel withdraw flow
     "refresh_balance": "wallets:refresh_balance",
     "bundle": "wallets:bundle",
     "bundle_distribute_sol": "wallets:bundle_distribute_sol",
@@ -200,16 +202,13 @@ async def start(update: Update, context):
         wallet_address = user_wallets[user_id]["public"]
         balance = get_wallet_balance(wallet_address)
         welcome_message = (
-            "Welcome to PUMPbot!\n\n"
-            "Solana’s fastest coin launch & trading bot built by the community.\n\n"
-            f"Your wallet address: `{wallet_address}`\n"
-            f"Balance: {balance:.4f} SOL\n\n"
-            "Deposit SOL to begin trading or launching coins.\n"
-            "• To trade, send a token address or a link (e.g. from Birdeye or pump.fun).\n"
-            "• To launch a coin, subscribe and follow the prompts.\n\n"
-            "More info: https://pump-bot-five.vercel.app/\n"
-            "Tap the Wallet button below for details (and to retrieve your private key if needed).\n"
-            "**Note:** Never share your private key."
+            "Welcome to PumpBot!\n\n"
+            "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
+            "You currently have no SOL balance.\n"
+            "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+            f"`{wallet_address}`\n\n"
+            "Once done, tap Refresh and your balance will appear here.\n\n"
+            "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
         )
         reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
         await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
@@ -228,13 +227,22 @@ async def go_to_main_menu(query, context):
         wallet_address = "No wallet"
         balance = 0.0
     welcome_message = (
-        "Welcome to PUMPbot!\n\n"
-        f"Your wallet address: `{wallet_address}`\n"
-        f"Balance: {balance:.4f} SOL\n\n"
-        "Use the buttons below to manage your wallet, subscribe, or launch your coin."
+        "Welcome to PumpBot!\n\n"
+        "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
+        "You currently have no SOL balance.\n"
+        "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+        f"`{wallet_address}`\n\n"
+        "Once done, tap Refresh and your balance will appear here.\n\n"
+        "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
     )
     reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
-    await query.message.edit_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
+    try:
+        await query.message.edit_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logger.info("go_to_main_menu: Message not modified; ignoring error.")
+        else:
+            raise e
 
 # ----- REFRESH HANDLER -----
 async def refresh_balance(update: Update, context):
@@ -247,7 +255,9 @@ async def refresh_balance(update: Update, context):
     wallet = user_wallets.get(user_id)
     if not wallet:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please create a wallet first.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No wallet found. Please create a wallet first.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     current_balance = get_wallet_balance(wallet["public"])
     wallet["balance"] = current_balance
@@ -280,7 +290,9 @@ async def handle_wallets_menu(update: Update, context):
     wallet = user_wallets.get(user_id)
     if not wallet:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please restart by typing /start.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No wallet found. Please restart by typing /start.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     wallet_address = wallet["public"]
     balance = get_wallet_balance(wallet_address)
@@ -308,7 +320,9 @@ async def show_wallet_details(update: Update, context):
     wallet = user_wallets.get(user_id)
     if not wallet:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please create a wallet first.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No wallet found. Please create a wallet first.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     balance = get_wallet_balance(wallet["public"])
     bundle_total = sum(b.get("balance", 0) for b in wallet.get("bundle", []))
@@ -340,7 +354,9 @@ async def show_bundle(update: Update, context):
     wallet = user_wallets.get(user_id)
     if not wallet:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please create a wallet first.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No wallet found. Please create a wallet first.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     if "bundle" not in wallet:
         bundle_list = []
@@ -370,17 +386,23 @@ async def distribute_sol_bundle(update: Update, context):
     wallet = user_wallets.get(user_id)
     if not wallet:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please create a wallet first.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No wallet found. Please create a wallet first.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     main_balance = get_wallet_balance(wallet["public"])
     if main_balance <= 0:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No SOL available in your main wallet for distribution.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("No SOL available in your main wallet for distribution.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     bundle = wallet.get("bundle")
     if not bundle or len(bundle) < 7:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("Bundle not found or incomplete. Please recreate the bundle.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("Bundle not found or incomplete. Please recreate the bundle.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     rand_values = [random.random() for _ in range(7)]
     total = sum(rand_values)
@@ -467,7 +489,9 @@ async def process_subscription_plan(update: Update, context):
     plan = query.data.split(":")[1]
     if plan not in SUBSCRIPTION_PRICING:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("Unknown subscription plan selected.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("Unknown subscription plan selected.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     sol_amount = SUBSCRIPTION_PRICING[plan]
     plan_names = {"weekly": "Weekly Subscription", "monthly": "Monthly Subscription", "lifetime": "Lifetime Subscription"}
@@ -508,7 +532,9 @@ async def confirm_subscription_payment(update: Update, context):
     result = process_subscription_payment(user_id, plan)
     if result["status"] != "success":
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text(result["message"], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text(result["message"],
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     message = (
         f"Payment confirmed for your {plan} subscription.\n\n"
@@ -544,12 +570,13 @@ def get_launch_flow_keyboard(context, confirm=False, include_proceed=False):
     if include_proceed:
         keyboard.append([InlineKeyboardButton("Proceed", callback_data=CALLBACKS["launch_proceed_buy_amount"])])
     if confirm:
-        keyboard.append([InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"]),
-                         InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_change_buy_amount"])])
-    user_id = context.user_data.get("user_id")
-    launched_callback = CALLBACKS["launched_coins"] if (user_id and user_coins.get(user_id)) else "disabled"
+        keyboard.append([
+            InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"]),
+            InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_change_buy_amount"])
+        ])
+    # This row includes access to launched coins and a Cancel button to exit the flow.
     row = [
-        InlineKeyboardButton("Launched Coins", callback_data=launched_callback),
+        InlineKeyboardButton("Launched Coins", callback_data=CALLBACKS["launched_coins"]),
         InlineKeyboardButton("Cancel", callback_data=CALLBACKS["launch_confirm_no"])
     ]
     keyboard.append(row)
@@ -614,7 +641,9 @@ async def process_launch_confirmation(query, context):
         link = coin_data.get(key, "")
         if ".com" not in link.lower():
             keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-            await query.message.edit_text(f"Invalid {key} link provided. Please include a proper URL (e.g. https://example.com).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            await query.message.edit_text(f"Invalid {key} link provided. Please include a proper URL (e.g. https://example.com).",
+                                            reply_markup=InlineKeyboardMarkup(keyboard),
+                                            parse_mode="Markdown")
             for i, (field, prompt) in enumerate(LAUNCH_STEPS):
                 if field == key:
                     context.user_data["launch_step_index"] = i
@@ -626,13 +655,17 @@ async def process_launch_confirmation(query, context):
     buy_amount = coin_data.get("buy_amount", 0)
     if not wallet or get_wallet_balance(wallet["public"]) < buy_amount:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("You don't have enough SOL in your wallet for that purchase.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("You don't have enough SOL in your wallet for that purchase.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
 
     result = create_coin_via_pumpfun(coin_data)
     if result.get('status') != 'success':
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text(f"Failed to launch coin: {result.get('message')}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text(f"Failed to launch coin: {result.get('message')}",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
 
     tx_signature = result.get('signature')
@@ -741,7 +774,9 @@ async def show_launched_coins(update: Update, context):
     coins = user_coins.get(user_id, [])
     if not coins:
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("You haven't launched any coins yet.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("You haven't launched any coins yet.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
         return
     message = "Your Launched Coins:\n\n"
     keyboard = []
@@ -786,7 +821,8 @@ async def button_callback(update: Update, context):
         elif query.data == CALLBACKS["create_wallet"]:
             user_id = query.from_user.id
             if user_id in user_wallets:
-                await query.message.edit_text("A wallet already exists. Use 'Import Wallet' to switch wallets.", parse_mode="Markdown")
+                await query.message.edit_text("A wallet already exists. Use 'Import Wallet' to switch wallets.",
+                                                parse_mode="Markdown")
                 return
             mnemonic, public_key, private_key = generate_solana_wallet()
             user_wallets[user_id] = {"public": public_key, "private": private_key, "mnemonic": mnemonic, "balance": 0}
@@ -805,10 +841,17 @@ async def button_callback(update: Update, context):
             push_nav_state(context, {"message_text": query.message.text,
                                       "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                       "parse_mode": "Markdown"})
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Cancel", callback_data=CALLBACKS["cancel_import_wallet"])]
+            ])
             await query.message.edit_text(
                 "Import Wallet\nPlease send your private key as a message.\nEnsure you are in a private chat with the bot.",
+                reply_markup=keyboard,
                 parse_mode="Markdown"
             )
+        elif query.data == CALLBACKS["cancel_import_wallet"]:
+            context.user_data.pop("awaiting_import", None)
+            await go_to_main_menu(query, context)
         elif query.data == CALLBACKS["show_private_key"]:
             user_id = query.from_user.id
             if user_id not in user_wallets:
@@ -858,8 +901,14 @@ async def button_callback(update: Update, context):
                                       "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                                       "parse_mode": "Markdown"})
             context.user_data["awaiting_withdraw"] = True
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Cancel", callback_data=CALLBACKS["cancel_withdraw_sol"])]
+            ])
             message = "Withdraw SOL\nReply with the destination address."
-            await query.message.edit_text(message, parse_mode="Markdown")
+            await query.message.edit_text(message, reply_markup=keyboard, parse_mode="Markdown")
+        elif query.data == CALLBACKS["cancel_withdraw_sol"]:
+            context.user_data.pop("awaiting_withdraw", None)
+            await go_to_main_menu(query, context)
         elif query.data == CALLBACKS["refresh_balance"]:
             await refresh_balance(update, context)
         elif query.data == CALLBACKS["bundle"]:
@@ -914,7 +963,9 @@ async def button_callback(update: Update, context):
     except Exception as e:
         logger.error(f"Error in button callback: {e}", exc_info=True)
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("An error occurred. Please try again.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text("An error occurred. Please try again.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
 
 # ----- HANDLERS FOR PRIVATE MESSAGES -----
 async def import_private_key(update: Update, context):
