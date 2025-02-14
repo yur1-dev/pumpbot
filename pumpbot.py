@@ -4,6 +4,7 @@ import random
 import base58
 import json
 import requests
+import asyncio
 from datetime import datetime, timedelta
 from mnemonic import Mnemonic
 from dotenv import load_dotenv
@@ -54,7 +55,6 @@ SUBSCRIPTION_PRICING = {
 }
 
 # CALLBACKS – "dynamic_back" is used for one‐step back navigation.
-# In all inline keyboards, the Main Menu button is on the left and Back is on the right.
 CALLBACKS = {
     "start": "start",
     "launch": "launch",
@@ -64,18 +64,20 @@ CALLBACKS = {
     "settings": "settings",
     "show_private_key": "wallets:show_private_key",
     "show_seed_phrase": "wallets:show_seed_phrase",
-    "create_wallet": "wallets:create_wallet",  # advanced option; will not overwrite if wallet exists
+    "create_wallet": "wallets:create_wallet",
     "import_wallet": "wallets:import_wallet",
-    "cancel_import_wallet": "wallets:cancel_import_wallet",  # NEW: Cancel import wallet flow
+    "cancel_import_wallet": "wallets:cancel_import_wallet",
     "back_to_wallets": "back_to_wallets",
     "wallet_details": "wallets:details",
     "deposit_sol": "wallets:deposit_sol",
     "withdraw_sol": "wallets:withdraw_sol",
-    "cancel_withdraw_sol": "wallets:cancel_withdraw_sol",  # NEW: Cancel withdraw flow
+    "cancel_withdraw_sol": "wallets:cancel_withdraw_sol",
     "refresh_balance": "wallets:refresh_balance",
     "bundle": "wallets:bundle",
     "bundle_distribute_sol": "wallets:bundle_distribute_sol",
-    "bump_volume": "bump_volume",
+    "bump_volume": "bump_volume",  # Volume trading feature
+    "create_bundle_for_volume": "create_bundle_for_volume",  # NEW: Create bundle for volume trading
+    "start_volume_trading": "start_volume_trading",  # NEW: Start volume trading session
     "socials": "socials",
     "dynamic_back": "dynamic_back",  # one-step back
     "launch_confirm_yes": "launch_confirm_yes",
@@ -86,12 +88,11 @@ CALLBACKS = {
     "subscription_weekly": "subscription:weekly",
     "subscription_monthly": "subscription:monthly",
     "subscription_lifetime": "subscription:lifetime",
-    # New callbacks for subscription confirmation flow:
-    "subscription_pending": "subscription:pending",  # used to display a confirmation prompt
-    "subscription_confirm": "subscription:confirm",  # final confirmation callback
+    "subscription_pending": "subscription:pending",
+    "subscription_confirm": "subscription:confirm",
 }
 
-user_wallets = {}         # { user_id: { public, private, mnemonic, balance, bundle } }
+user_wallets = {}         # { user_id: { public, private, mnemonic, balance, bundle, ... } }
 user_subscriptions = {}   # { user_id: { active, plan, amount, expires_at, tx_signature } }
 user_coins = {}           # { user_id: [ coin_data, ... ] }
 
@@ -187,7 +188,7 @@ def generate_inline_keyboard():
             InlineKeyboardButton("Settings", callback_data=CALLBACKS["settings"]),
         ],
         [
-            InlineKeyboardButton("Bump & Volume Bots", callback_data=CALLBACKS["bump_volume"]),
+            InlineKeyboardButton("Volume Bots", callback_data=CALLBACKS["bump_volume"]),
             InlineKeyboardButton("Socials", callback_data=CALLBACKS["socials"]),
         ],
         [InlineKeyboardButton("Refresh", callback_data=CALLBACKS["refresh_balance"])]
@@ -482,7 +483,6 @@ async def show_subscription_details(update: Update, context):
         ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# Revised: When a subscription plan is selected, the bot now informs the user that the payment will be automatically deducted.
 async def process_subscription_plan(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -508,7 +508,6 @@ async def process_subscription_plan(update: Update, context):
     ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# New function: subscription_payment_pending shows a confirmation prompt.
 async def subscription_payment_pending(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -523,7 +522,6 @@ async def subscription_payment_pending(update: Update, context):
     ]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# When the user confirms payment, process it.
 async def confirm_subscription_payment(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -574,7 +572,6 @@ def get_launch_flow_keyboard(context, confirm=False, include_proceed=False):
             InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"]),
             InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_change_buy_amount"])
         ])
-    # This row includes access to launched coins and a Cancel button to exit the flow.
     row = [
         InlineKeyboardButton("Launched Coins", callback_data=CALLBACKS["launched_coins"]),
         InlineKeyboardButton("Cancel", callback_data=CALLBACKS["launch_confirm_no"])
@@ -792,6 +789,83 @@ async def show_launched_coins(update: Update, context):
                       InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])])
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+# ----- BUMP & VOLUME TRADING FEATURE -----
+def simulate_trade(wallet, coin):
+    """
+    Simulate a trade for the given coin using a bundle wallet.
+    If the wallet has a 'token_balance', trade 10% of it.
+    """
+    token_balance = wallet.get("token_balance", 0)
+    if token_balance > 0:
+        trade_amount = round(token_balance * 0.1, 4)
+        # For simulation, reduce the wallet's token balance
+        wallet["token_balance"] = round(token_balance - trade_amount, 4)
+    else:
+        trade_amount = round(random.uniform(0.001, 0.01), 4)
+    buy_sig = base58.b58encode(os.urandom(32)).decode()[:44]
+    sell_sig = base58.b58encode(os.urandom(32)).decode()[:44]
+    return {
+         "wallet_public": wallet["public"],
+         "trade_amount": trade_amount,
+         "buy_sig": buy_sig,
+         "sell_sig": sell_sig
+    }
+
+def distribute_tokens(wallet, contract_address):
+    """
+    Simulate distribution of tokens (for the specified coin) among bundle wallets.
+    For simulation, assume the main wallet holds 1000 tokens.
+    """
+    bundle = wallet.get("bundle", [])
+    if not bundle:
+         return []
+    total_tokens = 1000
+    rand_values = [random.random() for _ in bundle]
+    total_rand = sum(rand_values)
+    distributions = [int((val/total_rand)*total_tokens) for val in rand_values]
+    for i, bundle_wallet in enumerate(bundle):
+         bundle_wallet["token_balance"] = distributions[i]
+    return distributions
+
+async def volume_trading_session(contract_address: str, update: Update, context):
+    """
+    Run a simulated volume trading session for 10 minutes.
+    Trades are executed every 30 seconds by each bundle wallet.
+    """
+    user_id = update.effective_user.id
+    wallet = user_wallets.get(user_id)
+    if not wallet or "bundle" not in wallet:
+         return
+    coin = {"name": f"Custom Coin ({contract_address[:6]}...)", "mint": contract_address}
+    trade_logs = []
+    duration = 10 * 60  # 10 minutes in seconds
+    interval = 30  # trades every 30 seconds
+    iterations = duration // interval
+    for i in range(int(iterations)):
+         iteration_trades = []
+         for bundle_wallet in wallet["bundle"]:
+              trade = simulate_trade(bundle_wallet, coin)
+              iteration_trades.append(trade)
+         trade_logs.append(iteration_trades)
+         await asyncio.sleep(interval)
+    summary = f"Volume Trading Session Completed for coin: *{coin.get('name', 'Unnamed Coin')}*\n\n"
+    total_trades = sum(len(trades) for trades in trade_logs)
+    summary += f"Total iterations: {int(iterations)}\nTotal individual trades: {total_trades}\n\n"
+    summary += "Last iteration trades:\n"
+    last_iteration = trade_logs[-1] if trade_logs else []
+    for trade in last_iteration:
+         summary += f"Wallet: `{trade['wallet_public']}`, Trade Amount: {trade['trade_amount']} tokens, Buy Tx: `{trade['buy_sig']}`, Sell Tx: `{trade['sell_sig']}`\n"
+    keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                 InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
+    await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# NEW: Execute volume trading for the contract address (now triggered after token distribution)
+async def execute_bump_volume_trade_for_contract(contract_address: str, update: Update, context):
+    # This function is now replaced by a two-step process:
+    # 1. Distribution of tokens (handled in handle_text_message)
+    # 2. Starting the trading session upon confirmation.
+    pass
+
 # ----- CALLBACK HANDLER -----
 async def button_callback(update: Update, context):
     query = update.callback_query
@@ -918,7 +992,6 @@ async def button_callback(update: Update, context):
         elif query.data == CALLBACKS["subscription"]:
             await show_subscription_details(update, context)
         elif query.data.startswith("subscription:"):
-            # New subscription flow:
             if query.data.startswith("subscription:pending:"):
                 await subscription_payment_pending(update, context)
             elif query.data.startswith("subscription:confirm:"):
@@ -954,12 +1027,52 @@ async def button_callback(update: Update, context):
             await go_to_main_menu(query, context)
         elif query.data == CALLBACKS["launched_coins"]:
             await show_launched_coins(update, context)
+        elif query.data == CALLBACKS["bump_volume"]:
+            # Bump & Volume: Check for bundle wallets first.
+            user_id = query.from_user.id
+            wallet = user_wallets.get(user_id)
+            if not wallet:
+                await query.message.edit_text("No wallet found. Please create a wallet first.")
+                return
+            if "bundle" not in wallet or not wallet["bundle"]:
+                keyboard = [
+                    [InlineKeyboardButton("Create Bundle Wallets", callback_data=CALLBACKS["create_bundle_for_volume"])],
+                    [InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]
+                ]
+                await query.message.edit_text("No bundle wallets found for volume trading. Do you want to create them?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            else:
+                context.user_data["awaiting_volume_contract"] = True
+                keyboard = [[InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]]
+                await query.message.edit_text("Please enter the contract address of the coin for volume trading:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif query.data == CALLBACKS["create_bundle_for_volume"]:
+            user_id = query.from_user.id
+            wallet = user_wallets.get(user_id)
+            if wallet is None:
+                await query.message.edit_text("No wallet found. Please create a wallet first.")
+                return
+            bundle_list = []
+            for _ in range(7):
+                mnemonic, public_key, private_key = generate_solana_wallet()
+                bundle_list.append({"public": public_key, "private": private_key, "mnemonic": mnemonic, "balance": 0})
+            wallet["bundle"] = bundle_list
+            message = "Bundle wallets created successfully. They will be used for volume trading.\n\n"
+            message += "Now, please enter the contract address of the coin for volume trading:"
+            context.user_data["awaiting_volume_contract"] = True
+            keyboard = [[InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]]
+            await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif query.data == CALLBACKS["start_volume_trading"]:
+            # Retrieve the stored contract address and start the trading session.
+            contract_address = context.user_data.get("volume_contract_address")
+            if not contract_address:
+                await query.message.edit_text("Contract address not found. Please try bump volume again.", parse_mode="Markdown")
+                return
+            await query.message.edit_text("Starting volume trading session. This will run for 10 minutes...", parse_mode="Markdown")
+            asyncio.create_task(volume_trading_session(contract_address, query, context))
+        elif query.data == CALLBACKS["socials"]:
+            await query.message.edit_text("Connect with our community on Telegram, Twitter, YouTube, and more.",
+                                            parse_mode="Markdown")
         else:
-            responses = {
-                CALLBACKS["bump_volume"]: "Tools to increase your coin's visibility and volume.",
-                CALLBACKS["socials"]: "Connect with our community on Telegram, Twitter, YouTube, and more.",
-            }
-            await query.message.edit_text(responses.get(query.data, "Feature coming soon!"))
+            await query.message.edit_text("Feature coming soon!")
     except Exception as e:
         logger.error(f"Error in button callback: {e}", exc_info=True)
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
@@ -992,7 +1105,33 @@ async def handle_withdraw_address(update: Update, context):
     else:
         await import_private_key(update, context)
 
+# ----- TEXT MESSAGE HANDLER -----
 async def handle_text_message(update: Update, context):
+    # Check if awaiting volume contract address input.
+    if context.user_data.get("awaiting_volume_contract"):
+         contract_address = update.message.text.strip()
+         context.user_data.pop("awaiting_volume_contract", None)
+         context.user_data["volume_contract_address"] = contract_address
+         user_id = update.message.from_user.id
+         wallet = user_wallets.get(user_id)
+         if not wallet or "bundle" not in wallet or not wallet["bundle"]:
+             keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+             await update.message.reply_text("No bundle wallets found for volume trading. Please create a bundle first.",
+                                             reply_markup=InlineKeyboardMarkup(keyboard),
+                                             parse_mode="Markdown")
+             return
+         # Distribute tokens among bundle wallets.
+         distribution = distribute_tokens(wallet, contract_address)
+         distribution_message = "Tokens have been distributed among bundle wallets:\n"
+         for i, bundle_wallet in enumerate(wallet["bundle"], start=1):
+             distribution_message += f"{i}. Wallet: `{bundle_wallet['public']}`, Tokens: {bundle_wallet.get('token_balance', 0)}\n"
+         distribution_message += "\nDo you want to start the volume trading session for this coin? (Trading will run for 10 minutes)"
+         keyboard = [
+             [InlineKeyboardButton("Start Trading", callback_data=CALLBACKS["start_volume_trading"])],
+             [InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]
+         ]
+         await update.message.reply_text(distribution_message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+         return
     if "launch_step_index" in context.user_data:
         index = context.user_data.get("launch_step_index", 0)
         if index >= len(LAUNCH_STEPS):
@@ -1040,6 +1179,7 @@ async def handle_text_message(update: Update, context):
     else:
         await update.message.reply_text("I did not understand that. Please use the available commands or tap a button.")
 
+# ----- MEDIA MESSAGE HANDLER -----
 async def handle_media_message(update: Update, context):
     if "launch_step_index" in context.user_data:
         index = context.user_data.get("launch_step_index", 0)
