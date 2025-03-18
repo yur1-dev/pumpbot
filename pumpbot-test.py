@@ -5,19 +5,39 @@ import base58
 import json
 import requests
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from mnemonic import Mnemonic
 from dotenv import load_dotenv
 
+# ─── MONKEY PATCH FOR SOLANA HTTP PROVIDER ─────────────────────────────
+# Fixes the proxy parameter issue and sets the expected attribute 'endpoint_uri'
+import httpx
+from solana.rpc.providers import http as solana_http
+
+def patched_http_provider_init(self, endpoint, timeout=10, extra_headers=None, proxy=None):
+    self.endpoint = endpoint
+    self.endpoint_uri = endpoint  # Set the expected attribute for internal calls
+    self.timeout = timeout
+    self.extra_headers = extra_headers
+    self.proxy = proxy
+    if proxy is not None:
+        proxies = {"http": proxy, "https": proxy}
+    else:
+        proxies = None
+    self.session = httpx.Client(timeout=timeout, proxies=proxies)
+
+solana_http.HTTPProvider.__init__ = patched_http_provider_init
+# ───────────────────────────────────────────────────────────────────────
+
 # --- Solana & Solders Imports ---
-from solders.keypair import Keypair as SoldersKeypair  # used for wallet generation (solders)
+from solders.keypair import Keypair as SoldersKeypair  # used for wallet generation
+from solders.message import Message
+from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey as PublicKey  # Use this as our PublicKey
+from solders.system_program import transfer  # Transfer instruction
 
 # solana-py for on-chain interactions
 from solana.rpc.api import Client
-from solana.transaction import Transaction
-from solana.system_program import TransferParams, transfer
-from solana.keypair import Keypair as SolanaKeypair
 from solana.rpc.types import TxOpts
 
 # --- Telegram Bot Imports ---
@@ -42,12 +62,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----- CONFIGURATION CONSTANTS -----
-# Subscription-related constants have been removed for free access
+SUBSCRIPTION_WALLET = {
+    "address": "84YWzdTEva6zmH43xPTX8oEUbxS47s6yRAkFp2D5esXk",
+    "balance": 0,
+}
+# For testing, set the weekly cost to 0
+SUBSCRIPTION_PRICING = {
+    "weekly": 0,
+    "monthly": 3,
+    "lifetime": 8,
+}
 
-# CALLBACKS – used for navigation
+# CALLBACKS for inline keyboards
 CALLBACKS = {
     "start": "start",
     "launch": "launch",
+    "subscription": "subscription",
+    "subscription_back": "subscription:back",
     "wallets": "wallets",
     "settings": "settings",
     "show_private_key": "wallets:show_private_key",
@@ -64,19 +95,24 @@ CALLBACKS = {
     "bundle": "wallets:bundle",
     "bundle_distribute_sol": "wallets:bundle_distribute_sol",
     "bump_volume": "bump_volume",  # Volume trading feature
-    "create_bundle_for_volume": "create_bundle_for_volume",  # Create bundle for volume trading
-    "start_volume_trading": "start_volume_trading",  # Start volume trading session
+    "create_bundle_for_volume": "create_bundle_for_volume",  # New: create bundle wallets
+    "start_volume_trading": "start_volume_trading",  # New: start volume trading session
     "socials": "socials",
-    "dynamic_back": "dynamic_back",  # one-step back navigation
+    "dynamic_back": "dynamic_back",  # one-step back
     "launch_confirm_yes": "launch_confirm_yes",
     "launch_confirm_no": "launch_confirm_no",
     "launched_coins": "launched_coins",
     "launch_proceed_buy_amount": "launch:proceed_buy_amount",
     "launch_change_buy_amount": "launch:change_buy_amount",
+    "subscription_weekly": "subscription:weekly",
+    "subscription_monthly": "subscription:monthly",
+    "subscription_lifetime": "subscription:lifetime",
+    "subscription_pending": "subscription:pending",
+    "subscription_confirm": "subscription:confirm",
 }
 
-# Global user data holders
 user_wallets = {}         # { user_id: { public, private, mnemonic, balance, bundle, ... } }
+user_subscriptions = {}   # { user_id: { active, plan, amount, expires_at, tx_signature } }
 user_coins = {}           # { user_id: [ coin_data, ... ] }
 
 # ----- HELPER FUNCTIONS FOR ON-CHAIN INTERACTION -----
@@ -86,7 +122,7 @@ def get_wallet_balance(public_key: str) -> float:
     try:
         pk_bytes = base58.b58decode(public_key)
         result = client.get_balance(PublicKey(pk_bytes))
-        lamports = result["result"]["value"]
+        lamports = result.value  # Access the lamports from the typed response
         balance = lamports / 10**9
         logger.info(f"Fetched balance for {public_key}: {balance} SOL")
         return balance
@@ -100,27 +136,34 @@ def transfer_sol(from_wallet: dict, to_address: str, amount_sol: float) -> dict:
     lamports = int(amount_sol * 10**9)
     try:
         secret_key = base58.b58decode(from_wallet["private"])
-        solana_keypair = SolanaKeypair.from_secret_key(secret_key)
+        keypair = SoldersKeypair.from_bytes(secret_key)
     except Exception as e:
         logger.error("Error decoding private key", exc_info=True)
         return {"status": "error", "message": "Invalid private key."}
-    txn = Transaction()
     try:
         to_pubkey = PublicKey(base58.b58decode(to_address))
-        txn.add(transfer(TransferParams(
-            from_pubkey=solana_keypair.public_key,
+    except Exception as e:
+        logger.error("Error decoding destination address", exc_info=True)
+        return {"status": "error", "message": "Invalid destination address."}
+    try:
+        latest_blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = latest_blockhash_resp.value.blockhash
+    except Exception as e:
+        logger.error("Error fetching latest blockhash", exc_info=True)
+        return {"status": "error", "message": "Error fetching latest blockhash."}
+    try:
+        instruction = transfer(
+            from_pubkey=PublicKey(base58.b58decode(from_wallet["public"])),
             to_pubkey=to_pubkey,
             lamports=lamports
-        )))
-        latest_blockhash_resp = client._provider.make_request("getLatestBlockhash", {})
-        if "result" not in latest_blockhash_resp:
-            raise Exception(f"Unexpected response format: {latest_blockhash_resp}")
-        txn.recent_blockhash = latest_blockhash_resp["result"]["value"]["blockhash"]
-    except Exception as e:
-        logger.error("Error building transaction", exc_info=True)
-        return {"status": "error", "message": "Error building transaction: " + str(e)}
-    try:
-        txn.sign(solana_keypair)
+        )
+        message = Message.new(
+            instructions=[instruction],
+            payer=PublicKey(base58.b58decode(from_wallet["public"])),
+            recent_blockhash=recent_blockhash
+        )
+        txn = VersionedTransaction.new(message)
+        txn.sign([keypair])
         raw_tx = txn.serialize()
         response = client.send_raw_transaction(raw_tx, opts=TxOpts(skip_preflight=True))
         logger.info(f"Transaction response: {response}")
@@ -166,6 +209,7 @@ def generate_inline_keyboard():
     return [
         [InlineKeyboardButton("Launch", callback_data=CALLBACKS["launch"])],
         [
+            InlineKeyboardButton("Subscription", callback_data=CALLBACKS["subscription"]),
             InlineKeyboardButton("Wallets", callback_data=CALLBACKS["wallets"]),
             InlineKeyboardButton("Settings", callback_data=CALLBACKS["settings"]),
         ],
@@ -187,7 +231,9 @@ async def start(update: Update, context):
         welcome_message = (
             "Welcome to PumpBot!\n\n"
             "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
-            f"Deposit SOL to your PumpBot wallet address:\n\n`{wallet_address}`\n\n"
+            "You currently have no SOL balance.\n"
+            "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+            f"`{wallet_address}`\n\n"
             "Once done, tap Refresh and your balance will appear here.\n\n"
             "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
         )
@@ -195,7 +241,7 @@ async def start(update: Update, context):
         await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error in start command: {e}", exc_info=True)
-        await update.message.reply_text("An error occurred while starting PumpBot. Please try again.")
+        await update.message.reply_text("An error occurred while starting PUMPbot. Please try again.")
 
 async def go_to_main_menu(query, context):
     context.user_data["nav_stack"] = []
@@ -203,12 +249,16 @@ async def go_to_main_menu(query, context):
     wallet = user_wallets.get(user_id)
     if wallet:
         wallet_address = wallet["public"]
+        balance = get_wallet_balance(wallet_address)
     else:
         wallet_address = "No wallet"
+        balance = 0.0
     welcome_message = (
         "Welcome to PumpBot!\n\n"
         "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
-        f"Deposit SOL to your PumpBot wallet address:\n\n`{wallet_address}`\n\n"
+        "You currently have no SOL balance.\n"
+        "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+        f"`{wallet_address}`\n\n"
         "Once done, tap Refresh and your balance will appear here.\n\n"
         "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
     )
@@ -225,7 +275,7 @@ async def go_to_main_menu(query, context):
 async def refresh_balance(update: Update, context):
     query = update.callback_query
     await query.answer()
-    if query.message.text.startswith("Welcome to PumpBot!"):
+    if query.message.text.startswith("Welcome to PUMPbot!"):
         await go_to_main_menu(query, context)
         return
     user_id = query.from_user.id
@@ -394,6 +444,150 @@ async def distribute_sol_bundle(update: Update, context):
                  InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+# ----- SUBSCRIPTION FEATURE (Revised Flow) -----
+def process_subscription_payment(user_id, plan):
+    subscription_cost = SUBSCRIPTION_PRICING.get(plan, 0)
+    wallet = user_wallets.get(user_id)
+    if not wallet:
+        return {"status": "error", "message": "No wallet found. Please create one first."}
+    
+    # For testing: if cost is zero, immediately activate subscription.
+    if subscription_cost == 0:
+        now = datetime.utcnow()
+        expires_at = now + timedelta(days=7)  # You can adjust this duration or set lifetime
+        user_subscriptions[user_id] = {
+            "active": True,
+            "plan": plan,
+            "amount": subscription_cost,
+            "expires_at": expires_at,
+            "tx_signature": "TEST_SIGNATURE"
+        }
+        return {"status": "success", "message": "Free subscription activated for testing."}
+    
+    current_balance = get_wallet_balance(wallet["public"])
+    if current_balance < subscription_cost:
+        return {"status": "error", "message": f"Insufficient balance. Current balance: {current_balance:.4f} SOL"}
+    
+    result = transfer_sol(wallet, SUBSCRIPTION_WALLET["address"], subscription_cost)
+    if result["status"] != "success":
+        return {"status": "error", "message": f"Transfer failed: {result['message']}"}
+    
+    SUBSCRIPTION_WALLET["balance"] = get_wallet_balance(SUBSCRIPTION_WALLET["address"])
+    now = datetime.utcnow()
+    if plan == "weekly":
+        expires_at = now + timedelta(days=7)
+    elif plan == "monthly":
+        expires_at = now + timedelta(days=30)
+    else:
+        expires_at = None
+    user_subscriptions[user_id] = {
+        "active": True,
+        "plan": plan,
+        "amount": subscription_cost,
+        "expires_at": expires_at,
+        "tx_signature": result.get("signature")
+    }
+    return {"status": "success", "message": "Subscription payment processed successfully."}
+
+async def show_subscription_details(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    subscription = user_subscriptions.get(query.from_user.id, {})
+    subscription_wallet = SUBSCRIPTION_WALLET
+    user_id = query.from_user.id
+    user_wallet_balance = get_wallet_balance(user_wallets.get(user_id, {}).get("public", ""))
+    if subscription.get("active"):
+        expires_at = subscription.get("expires_at")
+        if expires_at:
+            remaining = expires_at - datetime.utcnow()
+            remaining_str = "Expired" if remaining.total_seconds() < 0 else f"{remaining.days}d {remaining.seconds//3600}h {(remaining.seconds % 3600)//60}m remaining"
+        else:
+            remaining_str = "Lifetime"
+        message = (
+            f"*Subscription Active!*\n\nPlan: {subscription.get('plan').capitalize()}\n"
+            f"Expires: {remaining_str}\nTransaction Signature: `{subscription.get('tx_signature')}`\n"
+        )
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                     InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
+    else:
+        message = (
+            "Subscription Payment\n\n"
+            f"Subscription Wallet Address:\n`{subscription_wallet['address']}`\n\n"
+            f"Your Wallet Balance: {user_wallet_balance:.4f} SOL\n\n"
+            "Choose a subscription plan. The bot will automatically deduct the required SOL from your wallet when you confirm."
+        )
+        keyboard = [
+            [InlineKeyboardButton("Weekly - 1 SOL", callback_data="subscription:weekly")],
+            [InlineKeyboardButton("Monthly - 3 SOL", callback_data="subscription:monthly")],
+            [InlineKeyboardButton("Lifetime - 8 SOL", callback_data="subscription:lifetime")],
+            [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+             InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
+        ]
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def process_subscription_plan(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    plan = query.data.split(":")[1]
+    if plan not in SUBSCRIPTION_PRICING:
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await query.message.edit_text("Unknown subscription plan selected.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
+        return
+    sol_amount = SUBSCRIPTION_PRICING[plan]
+    plan_names = {"weekly": "Weekly Subscription", "monthly": "Monthly Subscription", "lifetime": "Lifetime Subscription"}
+    plan_name = plan_names[plan]
+    message = (
+        f"You've selected the {plan_name} for {sol_amount} SOL.\n\n"
+        "Please tap 'Confirm Payment' to continue."
+    )
+    keyboard = [
+        [InlineKeyboardButton("Confirm Payment", callback_data=f"{CALLBACKS['subscription_pending']}:{plan}")],
+        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
+    ]
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def subscription_payment_pending(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    plan = query.data.split(":")[2]
+    message = (
+        f"Do you want to continue?\n\n"
+        f"Please click 'Confirm' to subscribe to the {plan} plan."
+    )
+    keyboard = [
+        [InlineKeyboardButton("Confirm", callback_data=f"{CALLBACKS['subscription_confirm']}:{plan}")],
+        [InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]
+    ]
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def confirm_subscription_payment(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    plan = query.data.split(":")[2]
+    user_id = query.from_user.id
+    result = process_subscription_payment(user_id, plan)
+    if result["status"] != "success":
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await query.message.edit_text(result["message"],
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
+        return
+    message = (
+        f"Payment confirmed for your {plan} subscription.\n\n"
+        f"{SUBSCRIPTION_PRICING[plan]} SOL has been deducted from your wallet and transferred to {SUBSCRIPTION_WALLET['address']}.\n"
+        f"Transaction Signature: `{user_subscriptions[user_id].get('tx_signature')}`\n"
+        "Your subscription is now active."
+    )
+    keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                 InlineKeyboardButton("Back", callback_data=CALLBACKS["subscription"])]]
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def subscription_back(update: Update, context):
+    await show_subscription_details(update, context)
+
 # ----- COIN LAUNCH FLOW -----
 LAUNCH_STEPS = [
     ("name", "Please enter the *Coin Name*:"), 
@@ -480,7 +674,6 @@ async def prompt_current_launch_step(update_obj, context):
 async def process_launch_confirmation(query, context):
     coin_data = context.user_data.get("coin_data", {})
     user_id = query.from_user.id
-
     for key in ["telegram", "website", "twitter"]:
         link = coin_data.get(key, "")
         if ".com" not in link.lower():
@@ -494,7 +687,6 @@ async def process_launch_confirmation(query, context):
                     break
             await prompt_current_launch_step(query, context)
             return
-
     wallet = user_wallets.get(user_id)
     buy_amount = coin_data.get("buy_amount", 0)
     if not wallet or get_wallet_balance(wallet["public"]) < buy_amount:
@@ -503,7 +695,6 @@ async def process_launch_confirmation(query, context):
                                         reply_markup=InlineKeyboardMarkup(keyboard),
                                         parse_mode="Markdown")
         return
-
     result = create_coin_via_pumpfun(coin_data)
     if result.get('status') != 'success':
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
@@ -511,12 +702,10 @@ async def process_launch_confirmation(query, context):
                                         reply_markup=InlineKeyboardMarkup(keyboard),
                                         parse_mode="Markdown")
         return
-
     tx_signature = result.get('signature')
     mint = result.get('mint')
     tx_link = f"https://solscan.io/tx/{tx_signature}"
     chart_url = f"https://pumpportal.fun/chart/{mint}"
-
     if user_id not in user_coins:
         user_coins[user_id] = []
     user_coins[user_id].append({
@@ -528,7 +717,6 @@ async def process_launch_confirmation(query, context):
         "mint": mint,
         "dexscreener_url": "https://dexscreener.com/solana/"
     })
-
     message = (
         "Coin Launched!\n\n" +
         f"*Name:* {coin_data.get('name')}\n" +
@@ -543,16 +731,13 @@ async def process_launch_confirmation(query, context):
     context.user_data.pop("launch_step_index", None)
     context.user_data.pop("coin_data", None)
     keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
-                 InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
+                 InlineKeyboardButton("Back", callback_data=CALLBACKS["subscription"])]]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # ----- PUMPFUN INTEGRATION -----
 def create_coin_via_pumpfun(coin_data):
     try:
-        # Generate a new mint keypair
-        mint_keypair = SoldersKeypair()
-
-        # Prepare token metadata form data using coin_data
+        mint_keypair = SoldersKeypair()  # new mint keypair
         form_data = {
             'name': coin_data.get('name'),
             'symbol': coin_data.get('ticker'),
@@ -562,47 +747,31 @@ def create_coin_via_pumpfun(coin_data):
             'website': coin_data.get('website'),
             'showName': 'true'
         }
-
-        # Read the image file from the given path in coin_data
         image_path = coin_data.get('image')
         if not image_path or not os.path.exists(image_path):
             raise Exception("Image file not found. Ensure coin_data['image'] is a valid local path.")
         with open(image_path, 'rb') as f:
             file_content = f.read()
-
-        # Determine MIME type based on file extension
-        _, ext = os.path.splitext(image_path)
-        ext = ext.lower()
-        if ext in ['.jpg', '.jpeg']:
+        _, file_extension = os.path.splitext(image_path)
+        file_extension = file_extension.lower()
+        if file_extension in ['.jpg', '.jpeg']:
             mime_type = 'image/jpeg'
-        elif ext == '.png':
+        elif file_extension == '.png':
             mime_type = 'image/png'
-        elif ext == '.mp4':
+        elif file_extension == '.mp4':
             mime_type = 'video/mp4'
         else:
             mime_type = 'application/octet-stream'
         files = {'file': (os.path.basename(image_path), file_content, mime_type)}
-
-        # Upload image and metadata to IPFS via pump.fun
-        ipfs_response = requests.post("https://pump.fun/api/ipfs", data=form_data, files=files)
-        ipfs_response.raise_for_status()
-        ipfs_data = ipfs_response.json()
-        metadata_uri = ipfs_data.get('metadataUri')
-        if not metadata_uri:
-            raise Exception("No metadataUri returned from the IPFS upload.")
-
-        # Create token metadata for the transaction
+        ipfs_url = "https://pump.fun/api/ipfs"
+        metadata_response = requests.post(ipfs_url, data=form_data, files=files)
+        metadata_response.raise_for_status()
+        metadata_response_json = metadata_response.json()
         token_metadata = {
             'name': form_data['name'],
             'symbol': form_data['symbol'],
-            'uri': metadata_uri
+            'uri': metadata_response_json.get('metadataUri')
         }
-
-        # Get your API key from environment variables
-        api_key = os.getenv("PUMPFUN_API_KEY")
-        if not api_key:
-            raise Exception("PUMPFUN_API_KEY environment variable not set. Please obtain a valid key.")
-        trade_url = f"https://pumpportal.fun/api/trade?api-key={api_key}"
         payload = {
             'action': 'create',
             'tokenMetadata': token_metadata,
@@ -613,14 +782,18 @@ def create_coin_via_pumpfun(coin_data):
             'priorityFee': 0.0005,
             'pool': 'pump'
         }
+        api_key = os.getenv("PUMPFUN_API_KEY")
+        if not api_key:
+            raise Exception("PUMPFUN_API_KEY environment variable not set. Please obtain a valid key from Pump.fun.")
+        trade_url = f"https://pumpportal.fun/api/trade?api-key={api_key}"
         headers = {'Content-Type': 'application/json'}
-        trade_response = requests.post(trade_url, headers=headers, data=json.dumps(payload))
-        trade_response.raise_for_status()
-        trade_data = trade_response.json()
-        signature = trade_data.get('signature')
-        if not signature:
+        response = requests.post(trade_url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
+        result = response.json()
+        tx_signature = result.get('signature')
+        if not tx_signature:
             raise Exception("No signature returned from pump.fun")
-        return {'status': 'success', 'signature': signature, 'mint': str(mint_keypair.pubkey())}
+        return {'status': 'success', 'signature': tx_signature, 'mint': str(mint_keypair.pubkey())}
     except Exception as e:
         logger.error(f"Error in create_coin_via_pumpfun: {e}", exc_info=True)
         return {'status': 'error', 'message': str(e)}
@@ -653,6 +826,10 @@ async def show_launched_coins(update: Update, context):
 
 # ----- BUMP & VOLUME TRADING FEATURE -----
 def simulate_trade(wallet, coin):
+    """
+    Simulate a trade for the given coin using a bundle wallet.
+    If the wallet has a 'token_balance', trade 10% of it.
+    """
     token_balance = wallet.get("token_balance", 0)
     if token_balance > 0:
         trade_amount = round(token_balance * 0.1, 4)
@@ -669,6 +846,10 @@ def simulate_trade(wallet, coin):
     }
 
 def distribute_tokens(wallet, contract_address):
+    """
+    Simulate distribution of tokens among bundle wallets.
+    For simulation, assume the main wallet holds 1000 tokens.
+    """
     bundle = wallet.get("bundle", [])
     if not bundle:
          return []
@@ -681,13 +862,17 @@ def distribute_tokens(wallet, contract_address):
     return distributions
 
 async def volume_trading_session(contract_address: str, update: Update, context):
+    """
+    Run a simulated volume trading session for 10 minutes.
+    Trades are executed every 30 seconds by each bundle wallet.
+    """
     user_id = update.effective_user.id
     wallet = user_wallets.get(user_id)
     if not wallet or "bundle" not in wallet:
          return
     coin = {"name": f"Custom Coin ({contract_address[:6]}...)", "mint": contract_address}
     trade_logs = []
-    duration = 10 * 60  # 10 minutes
+    duration = 10 * 60
     interval = 30
     iterations = duration // interval
     for i in range(int(iterations)):
@@ -708,6 +893,9 @@ async def volume_trading_session(contract_address: str, update: Update, context)
                  InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
     await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+async def execute_bump_volume_trade_for_contract(contract_address: str, update: Update, context):
+    pass
+
 # ----- CALLBACK HANDLER -----
 async def button_callback(update: Update, context):
     query = update.callback_query
@@ -716,6 +904,14 @@ async def button_callback(update: Update, context):
         if query.data == CALLBACKS["start"]:
             await go_to_main_menu(query, context)
             return
+        if query.data == CALLBACKS["subscription_back"]:
+            await show_subscription_details(update, context)
+            return
+        if query.data == "disabled":
+            await query.answer("No launched coins yet.", show_alert=True)
+            return
+        if query.data == CALLBACKS["wallets"]:
+            await handle_wallets_menu(update, context)
         elif query.data == CALLBACKS["dynamic_back"]:
             previous_state = pop_nav_state(context)
             if previous_state:
@@ -726,8 +922,6 @@ async def button_callback(update: Update, context):
                 )
             else:
                 await go_to_main_menu(query, context)
-        elif query.data == CALLBACKS["wallets"]:
-            await handle_wallets_menu(update, context)
         elif query.data == CALLBACKS["create_wallet"]:
             user_id = query.from_user.id
             if user_id in user_wallets:
@@ -825,10 +1019,30 @@ async def button_callback(update: Update, context):
             await show_bundle(update, context)
         elif query.data == CALLBACKS["bundle_distribute_sol"]:
             await distribute_sol_bundle(update, context)
+        elif query.data == CALLBACKS["subscription"]:
+            await show_subscription_details(update, context)
+        elif query.data.startswith("subscription:"):
+            if query.data.startswith("subscription:pending:"):
+                await subscription_payment_pending(update, context)
+            elif query.data.startswith("subscription:confirm:"):
+                await confirm_subscription_payment(update, context)
+            else:
+                await process_subscription_plan(update, context)
         elif query.data == CALLBACKS["launch"]:
-            # Start launch flow directly (free access)
-            start_launch_flow(context)
-            await prompt_current_launch_step(query, context)
+            user_id = query.from_user.id
+            subscription = user_subscriptions.get(user_id, {})
+            if not subscription.get("active"):
+                message = ("You must subscribe to use the Launch feature.\nPlease subscribe first.")
+                keyboard = [
+                    [InlineKeyboardButton("Subscribe", callback_data=CALLBACKS["subscription"]),
+                     InlineKeyboardButton("Docs", url="https://yourgitbooklink.com")],
+                    [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                     InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
+                ]
+                await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            else:
+                start_launch_flow(context)
+                await prompt_current_launch_step(query, context)
         elif query.data == CALLBACKS["launch_proceed_buy_amount"]:
             context.user_data["launch_step_index"] += 1
             await prompt_current_launch_step(query, context)
@@ -1025,7 +1239,9 @@ def main():
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
-    application = Application.builder().token(bot_token).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest()  # no proxy provided
+    application = Application.builder().token(bot_token).request(request).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_callback))

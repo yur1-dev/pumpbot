@@ -9,17 +9,36 @@ from datetime import datetime, timedelta
 from mnemonic import Mnemonic
 from dotenv import load_dotenv
 
+# ─── MONKEY PATCH FOR SOLANA HTTP PROVIDER ─────────────────────────────
+# This patch fixes the proxy parameter issue and sets the expected attribute 'endpoint_uri'
+import httpx
+from solana.rpc.providers import http as solana_http
+
+def patched_http_provider_init(self, endpoint, timeout=10, extra_headers=None, proxy=None):
+    self.endpoint = endpoint
+    self.endpoint_uri = endpoint  # Set the expected attribute
+    self.timeout = timeout
+    self.extra_headers = extra_headers
+    self.proxy = proxy
+    if proxy is not None:
+        # httpx expects proxies as a dictionary.
+        proxies = {"http": proxy, "https": proxy}
+    else:
+        proxies = None
+    self.session = httpx.Client(timeout=timeout, proxies=proxies)
+
+solana_http.HTTPProvider.__init__ = patched_http_provider_init
+# ───────────────────────────────────────────────────────────────────────
+
 # --- Solana & Solders Imports ---
 from solders.keypair import Keypair as SoldersKeypair  # used for wallet generation (solders)
 from solders.message import Message
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey as PublicKey  # Use this as our PublicKey
+from solders.system_program import transfer  # Use solders’ transfer instruction
 
 # solana-py for on-chain interactions
 from solana.rpc.api import Client
-from solana.transaction import Transaction
-from solana.system_program import TransferParams, transfer
-from solana.keypair import Keypair as SolanaKeypair
 from solana.rpc.types import TxOpts
 
 # --- Telegram Bot Imports ---
@@ -49,7 +68,7 @@ SUBSCRIPTION_WALLET = {
     "balance": 0,
 }
 SUBSCRIPTION_PRICING = {
-    "weekly": 0.03,
+    "weekly": 0,
     "monthly": 3,
     "lifetime": 8,
 }
@@ -103,7 +122,8 @@ def get_wallet_balance(public_key: str) -> float:
     try:
         pk_bytes = base58.b58decode(public_key)
         result = client.get_balance(PublicKey(pk_bytes))
-        lamports = result["result"]["value"]
+        # Updated: Use attribute access since result is a typed object
+        lamports = result.value
         balance = lamports / 10**9
         logger.info(f"Fetched balance for {public_key}: {balance} SOL")
         return balance
@@ -112,32 +132,43 @@ def get_wallet_balance(public_key: str) -> float:
         return 0.0
 
 def transfer_sol(from_wallet: dict, to_address: str, amount_sol: float) -> dict:
+    """
+    Build and send a SOL transfer transaction using solders’ API.
+    """
     rpc_url = os.getenv("SOLANA_RPC_URL")
     client = Client(rpc_url)
     lamports = int(amount_sol * 10**9)
     try:
         secret_key = base58.b58decode(from_wallet["private"])
-        solana_keypair = SolanaKeypair.from_secret_key(secret_key)
+        keypair = SoldersKeypair.from_bytes(secret_key)
     except Exception as e:
         logger.error("Error decoding private key", exc_info=True)
         return {"status": "error", "message": "Invalid private key."}
-    txn = Transaction()
     try:
         to_pubkey = PublicKey(base58.b58decode(to_address))
-        txn.add(transfer(TransferParams(
-            from_pubkey=solana_keypair.public_key,
+    except Exception as e:
+        logger.error("Error decoding destination address", exc_info=True)
+        return {"status": "error", "message": "Invalid destination address."}
+    try:
+        # Use the built-in method to get the latest blockhash
+        latest_blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = latest_blockhash_resp.value.blockhash
+    except Exception as e:
+        logger.error("Error fetching latest blockhash", exc_info=True)
+        return {"status": "error", "message": "Error fetching latest blockhash."}
+    try:
+        instruction = transfer(
+            from_pubkey=PublicKey(base58.b58decode(from_wallet["public"])),
             to_pubkey=to_pubkey,
             lamports=lamports
-        )))
-        latest_blockhash_resp = client._provider.make_request("getLatestBlockhash", {})
-        if "result" not in latest_blockhash_resp:
-            raise Exception(f"Unexpected response format: {latest_blockhash_resp}")
-        txn.recent_blockhash = latest_blockhash_resp["result"]["value"]["blockhash"]
-    except Exception as e:
-        logger.error("Error building transaction", exc_info=True)
-        return {"status": "error", "message": "Error building transaction: " + str(e)}
-    try:
-        txn.sign(solana_keypair)
+        )
+        message = Message.new(
+            instructions=[instruction],
+            payer=PublicKey(base58.b58decode(from_wallet["public"])),
+            recent_blockhash=recent_blockhash
+        )
+        txn = VersionedTransaction.new(message)
+        txn.sign([keypair])
         raw_tx = txn.serialize()
         response = client.send_raw_transaction(raw_tx, opts=TxOpts(skip_preflight=True))
         logger.info(f"Transaction response: {response}")
@@ -500,7 +531,6 @@ async def process_subscription_plan(update: Update, context):
         f"You've selected the {plan_name} for {sol_amount} SOL.\n\n"
         "Please tap 'Confirm Payment' to continue."
     )
-
     keyboard = [
         [InlineKeyboardButton("Confirm Payment", callback_data=f"{CALLBACKS['subscription_pending']}:{plan}")],
         [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
@@ -633,7 +663,6 @@ async def prompt_current_launch_step(update_obj, context):
 async def process_launch_confirmation(query, context):
     coin_data = context.user_data.get("coin_data", {})
     user_id = query.from_user.id
-
     for key in ["telegram", "website", "twitter"]:
         link = coin_data.get(key, "")
         if ".com" not in link.lower():
@@ -647,7 +676,6 @@ async def process_launch_confirmation(query, context):
                     break
             await prompt_current_launch_step(query, context)
             return
-
     wallet = user_wallets.get(user_id)
     buy_amount = coin_data.get("buy_amount", 0)
     if not wallet or get_wallet_balance(wallet["public"]) < buy_amount:
@@ -656,7 +684,6 @@ async def process_launch_confirmation(query, context):
                                         reply_markup=InlineKeyboardMarkup(keyboard),
                                         parse_mode="Markdown")
         return
-
     result = create_coin_via_pumpfun(coin_data)
     if result.get('status') != 'success':
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
@@ -664,12 +691,10 @@ async def process_launch_confirmation(query, context):
                                         reply_markup=InlineKeyboardMarkup(keyboard),
                                         parse_mode="Markdown")
         return
-
     tx_signature = result.get('signature')
     mint = result.get('mint')
     tx_link = f"https://solscan.io/tx/{tx_signature}"
     chart_url = f"https://pumpportal.fun/chart/{mint}"
-
     if user_id not in user_coins:
         user_coins[user_id] = []
     user_coins[user_id].append({
@@ -681,7 +706,6 @@ async def process_launch_confirmation(query, context):
         "mint": mint,
         "dexscreener_url": "https://dexscreener.com/solana/"
     })
-
     message = (
         "Coin Launched!\n\n" +
         f"*Name:* {coin_data.get('name')}\n" +
@@ -798,7 +822,6 @@ def simulate_trade(wallet, coin):
     token_balance = wallet.get("token_balance", 0)
     if token_balance > 0:
         trade_amount = round(token_balance * 0.1, 4)
-        # For simulation, reduce the wallet's token balance
         wallet["token_balance"] = round(token_balance - trade_amount, 4)
     else:
         trade_amount = round(random.uniform(0.001, 0.01), 4)
@@ -813,7 +836,7 @@ def simulate_trade(wallet, coin):
 
 def distribute_tokens(wallet, contract_address):
     """
-    Simulate distribution of tokens (for the specified coin) among bundle wallets.
+    Simulate distribution of tokens among bundle wallets.
     For simulation, assume the main wallet holds 1000 tokens.
     """
     bundle = wallet.get("bundle", [])
@@ -838,8 +861,8 @@ async def volume_trading_session(contract_address: str, update: Update, context)
          return
     coin = {"name": f"Custom Coin ({contract_address[:6]}...)", "mint": contract_address}
     trade_logs = []
-    duration = 10 * 60  # 10 minutes in seconds
-    interval = 30  # trades every 30 seconds
+    duration = 10 * 60
+    interval = 30
     iterations = duration // interval
     for i in range(int(iterations)):
          iteration_trades = []
@@ -859,11 +882,7 @@ async def volume_trading_session(contract_address: str, update: Update, context)
                  InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
     await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# NEW: Execute volume trading for the contract address (now triggered after token distribution)
 async def execute_bump_volume_trade_for_contract(contract_address: str, update: Update, context):
-    # This function is now replaced by a two-step process:
-    # 1. Distribution of tokens (handled in handle_text_message)
-    # 2. Starting the trading session upon confirmation.
     pass
 
 # ----- CALLBACK HANDLER -----
@@ -1028,7 +1047,6 @@ async def button_callback(update: Update, context):
         elif query.data == CALLBACKS["launched_coins"]:
             await show_launched_coins(update, context)
         elif query.data == CALLBACKS["bump_volume"]:
-            # Bump & Volume: Check for bundle wallets first.
             user_id = query.from_user.id
             wallet = user_wallets.get(user_id)
             if not wallet:
@@ -1061,7 +1079,6 @@ async def button_callback(update: Update, context):
             keyboard = [[InlineKeyboardButton("Cancel", callback_data=CALLBACKS["dynamic_back"])]]
             await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         elif query.data == CALLBACKS["start_volume_trading"]:
-            # Retrieve the stored contract address and start the trading session.
             contract_address = context.user_data.get("volume_contract_address")
             if not contract_address:
                 await query.message.edit_text("Contract address not found. Please try bump volume again.", parse_mode="Markdown")
@@ -1107,7 +1124,6 @@ async def handle_withdraw_address(update: Update, context):
 
 # ----- TEXT MESSAGE HANDLER -----
 async def handle_text_message(update: Update, context):
-    # Check if awaiting volume contract address input.
     if context.user_data.get("awaiting_volume_contract"):
          contract_address = update.message.text.strip()
          context.user_data.pop("awaiting_volume_contract", None)
@@ -1120,7 +1136,6 @@ async def handle_text_message(update: Update, context):
                                              reply_markup=InlineKeyboardMarkup(keyboard),
                                              parse_mode="Markdown")
              return
-         # Distribute tokens among bundle wallets.
          distribution = distribute_tokens(wallet, contract_address)
          distribution_message = "Tokens have been distributed among bundle wallets:\n"
          for i, bundle_wallet in enumerate(wallet["bundle"], start=1):
@@ -1213,7 +1228,10 @@ def main():
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
-    application = Application.builder().token(bot_token).build()
+    # Fix: Create a custom HTTPXRequest without a 'proxy' argument
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest()  # no proxy provided
+    application = Application.builder().token(bot_token).request(request).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_callback))
