@@ -12,14 +12,13 @@ from dotenv import load_dotenv
 # --- Solana & Solders Imports ---
 from solders.keypair import Keypair as SoldersKeypair  # used for wallet generation (solders)
 from solders.message import Message
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction, Transaction
 from solders.pubkey import Pubkey as PublicKey  # Use this as our PublicKey
+from solders.system_program import transfer, TransferParams
+from solders.instruction import Instruction
 
 # solana-py for on-chain interactions
 from solana.rpc.api import Client
-from solana.transaction import Transaction
-from solana.system_program import TransferParams, transfer
-from solana.keypair import Keypair as SolanaKeypair
 from solana.rpc.types import TxOpts
 
 # --- Telegram Bot Imports ---
@@ -98,12 +97,19 @@ user_coins = {}           # { user_id: [ coin_data, ... ] }
 
 # ----- HELPER FUNCTIONS FOR ON-CHAIN INTERACTION -----
 def get_wallet_balance(public_key: str) -> float:
-    rpc_url = os.getenv("SOLANA_RPC_URL")
+    rpc_url = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     client = Client(rpc_url)
     try:
         pk_bytes = base58.b58decode(public_key)
-        result = client.get_balance(PublicKey(pk_bytes))
-        lamports = result["result"]["value"]
+        pubkey = PublicKey(pk_bytes)
+        result = client.get_balance(pubkey)
+        
+        # Handle the response format correctly
+        if hasattr(result, 'value'):
+            lamports = result.value
+        else:
+            lamports = result["result"]["value"]
+            
         balance = lamports / 10**9
         logger.info(f"Fetched balance for {public_key}: {balance} SOL")
         return balance
@@ -112,43 +118,58 @@ def get_wallet_balance(public_key: str) -> float:
         return 0.0
 
 def transfer_sol(from_wallet: dict, to_address: str, amount_sol: float) -> dict:
-    rpc_url = os.getenv("SOLANA_RPC_URL")
+    rpc_url = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     client = Client(rpc_url)
     lamports = int(amount_sol * 10**9)
+    
     try:
         secret_key = base58.b58decode(from_wallet["private"])
-        solana_keypair = SolanaKeypair.from_secret_key(secret_key)
+        solana_keypair = SoldersKeypair.from_bytes(secret_key)
     except Exception as e:
         logger.error("Error decoding private key", exc_info=True)
         return {"status": "error", "message": "Invalid private key."}
-    txn = Transaction()
+    
     try:
         to_pubkey = PublicKey(base58.b58decode(to_address))
-        txn.add(transfer(TransferParams(
-            from_pubkey=solana_keypair.public_key,
-            to_pubkey=to_pubkey,
-            lamports=lamports
-        )))
-        latest_blockhash_resp = client._provider.make_request("getLatestBlockhash", {})
-        if "result" not in latest_blockhash_resp:
-            raise Exception(f"Unexpected response format: {latest_blockhash_resp}")
-        txn.recent_blockhash = latest_blockhash_resp["result"]["value"]["blockhash"]
-    except Exception as e:
-        logger.error("Error building transaction", exc_info=True)
-        return {"status": "error", "message": "Error building transaction: " + str(e)}
-    try:
-        txn.sign(solana_keypair)
-        raw_tx = txn.serialize()
-        response = client.send_raw_transaction(raw_tx, opts=TxOpts(skip_preflight=True))
+        
+        # Create transfer instruction
+        transfer_instruction = transfer(
+            TransferParams(
+                from_pubkey=solana_keypair.pubkey(),
+                to_pubkey=to_pubkey,
+                lamports=lamports
+            )
+        )
+        
+        # Get latest blockhash
+        latest_blockhash_resp = client.get_latest_blockhash()
+        if hasattr(latest_blockhash_resp, 'value'):
+            recent_blockhash = latest_blockhash_resp.value.blockhash
+        else:
+            recent_blockhash = latest_blockhash_resp["result"]["value"]["blockhash"]
+        
+        # Create and sign transaction
+        txn = Transaction.new_with_payer([transfer_instruction], solana_keypair.pubkey())
+        signed_txn = txn.sign([solana_keypair], recent_blockhash)
+        
+        # Send transaction
+        response = client.send_transaction(signed_txn, opts=TxOpts(skip_preflight=True))
+        
         logger.info(f"Transaction response: {response}")
-        if isinstance(response, dict) and "result" in response:
+        
+        if hasattr(response, 'value'):
+            signature = str(response.value)
+            logger.info(f"Transfer successful: {signature}")
+            return {"status": "success", "signature": signature}
+        elif isinstance(response, dict) and "result" in response:
             signature = response["result"]
             logger.info(f"Transfer successful: {signature}")
             return {"status": "success", "signature": signature}
         else:
-            error_msg = response.get("error", "Unknown error") if isinstance(response, dict) else str(response)
+            error_msg = str(response)
             logger.error(f"Transfer error: {error_msg}")
             return {"status": "error", "message": error_msg}
+            
     except Exception as e:
         logger.error("Error sending transaction: " + str(e), exc_info=True)
         return {"status": "error", "message": "Error sending transaction: " + str(e)}
@@ -475,7 +496,7 @@ async def show_subscription_details(update: Update, context):
             "Choose a subscription plan. The bot will automatically deduct the required SOL from your wallet when you confirm."
         )
         keyboard = [
-            [InlineKeyboardButton("Weekly - 1 SOL", callback_data="subscription:weekly")],
+            [InlineKeyboardButton("Weekly - 0.03 SOL", callback_data="subscription:weekly")],
             [InlineKeyboardButton("Monthly - 3 SOL", callback_data="subscription:monthly")],
             [InlineKeyboardButton("Lifetime - 8 SOL", callback_data="subscription:lifetime")],
             [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
@@ -556,7 +577,7 @@ LAUNCH_STEPS = [
     ("telegram", "Please enter your *Telegram Link*:"), 
     ("website", "Please enter your *Website Link* (include https:// and .com):"), 
     ("twitter", "Please enter your *Twitter/X Link* (include https:// and .com):"), 
-    ("buy_amount", "Choose how many coins you want to buy (optional).\nTip: Buying a small amount helps protect your coin from snipers.")
+    ("buy_amount", "Choose how many SOL you want to spend buying your coin (optional).\nTip: Buying a small amount helps protect your coin from snipers.")
 ]
 
 def start_launch_flow(context):
@@ -1069,8 +1090,18 @@ async def button_callback(update: Update, context):
             await query.message.edit_text("Starting volume trading session. This will run for 10 minutes...", parse_mode="Markdown")
             asyncio.create_task(volume_trading_session(contract_address, query, context))
         elif query.data == CALLBACKS["socials"]:
-            await query.message.edit_text("Connect with our community on Telegram, Twitter, YouTube, and more.",
-                                            parse_mode="Markdown")
+            message = (
+                "Connect with our community!\n\n"
+                "Join our official channels for updates, support, and community discussions."
+            )
+            keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
+            await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif query.data == CALLBACKS["settings"]:
+            message = "Settings\n\nConfiguration and preferences will be available here soon."
+            keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
+                         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]]
+            await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         else:
             await query.message.edit_text("Feature coming soon!")
     except Exception as e:
@@ -1100,6 +1131,16 @@ async def handle_withdraw_address(update: Update, context):
     if context.user_data.get("awaiting_withdraw"):
         destination = update.message.text.strip()
         user_id = update.message.from_user.id
+        wallet = user_wallets.get(user_id)
+        
+        # Validate destination address
+        try:
+            base58.b58decode(destination)
+        except Exception:
+            await update.message.reply_text("Invalid Solana address. Please provide a valid address.", parse_mode="Markdown")
+            return
+        
+        # For demo purposes, show withdrawal request (implement actual withdrawal logic here)
         await update.message.reply_text(f"Withdrawal requested to address:\n`{destination}`\n(This feature is not fully implemented yet.)", parse_mode="Markdown")
         context.user_data["awaiting_withdraw"] = False
     else:
@@ -1132,6 +1173,7 @@ async def handle_text_message(update: Update, context):
          ]
          await update.message.reply_text(distribution_message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
          return
+    
     if "launch_step_index" in context.user_data:
         index = context.user_data.get("launch_step_index", 0)
         if index >= len(LAUNCH_STEPS):
@@ -1171,13 +1213,18 @@ async def handle_text_message(update: Update, context):
         context.user_data["launch_step_index"] = index + 1
         await prompt_current_launch_step(update, context)
         return
+    
     if context.user_data.get("awaiting_withdraw"):
         await handle_withdraw_address(update, context)
+        return
+    
     if context.user_data.get("awaiting_import"):
         await import_private_key(update, context)
         context.user_data.pop("awaiting_import", None)
-    else:
-        await update.message.reply_text("I did not understand that. Please use the available commands or tap a button.")
+        return
+    
+    # Default response for unrecognized text
+    await update.message.reply_text("I did not understand that. Please use the available commands or tap a button.")
 
 # ----- MEDIA MESSAGE HANDLER -----
 async def handle_media_message(update: Update, context):
