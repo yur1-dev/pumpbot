@@ -1,0 +1,25 @@
+
+LOCK TOKEN CREATION INSTRUCTIONS
+===============================
+
+Your LOCK Token Details:
+• Address: 2bTb6sC8pCffeLaBRVvNhw3XmVHeGPR4EyDwyae8afKZ
+• Name: testlock
+• Symbol: tlock
+• Ends with: afKZ
+
+STEP 1: Go to https://raydium.io/launchpad/
+STEP 2: Click "Launch Token"
+STEP 3: Connect/Import Wallet:
+   Private Key: fLX9TRK7v3DbeAVEP6zt3UPu7SkkaD3qDX4io1FmPAaVKALSLecoRKpworGcfFzE4ivSSVTTgmk1MzaAYWrHXZV
+STEP 4: Fill token details:
+   - Name: testlock
+   - Symbol: tlock
+   - Upload your images
+STEP 5: Launch!
+
+Your token will have the vanity address ending with 'lock'!
+Files saved to: lock_tokens/lock_20250830_053233.*
+
+IMPORTANT: Your token will be real and tradeable on Raydium LaunchLab.
+It will show on Solscan and integrate with the full Solana ecosystem.

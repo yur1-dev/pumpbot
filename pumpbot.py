@@ -6,6 +6,9 @@ import json
 import requests
 import asyncio
 import time
+import threading
+import subprocess
+import base64
 from datetime import datetime, timedelta, timezone
 from mnemonic import Mnemonic
 from dotenv import load_dotenv
@@ -55,13 +58,23 @@ SUBSCRIPTION_PRICING = {
     "lifetime": 8,
 }
 
-# CALLBACKS – Enhanced with platform selection and percentage withdrawals
+# VANITY ADDRESS CONFIGURATION - LOCK SUFFIX
+CONTRACT_SUFFIX = "lock"   # Contract addresses will end with "lock"
+VANITY_GENERATION_TIMEOUT = 180   # 3 minutes timeout for lock generation  
+FALLBACK_SUFFIX = ""    # Empty fallback = random address
+
+# RAYDIUM LAUNCHLAB CONFIGURATION
+RAYDIUM_LAUNCHLAB_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+LETSBONK_METADATA_SERVICE = "https://gateway.pinata.cloud/ipfs/"
+
+# GLOBAL FLAG FOR NODE.JS AVAILABILITY
+NODEJS_AVAILABLE = False
+NODEJS_SETUP_MESSAGE = ""
+
+# CALLBACKS – Simplified for own platform only
 CALLBACKS = {
     "start": "start",
     "launch": "launch",
-    "launch_platform_pump": "launch_platform_pump",
-    "launch_platform_bonk": "launch_platform_bonk",
-    "launch_platform_moonshot": "launch_platform_moonshot",
     "subscription": "subscription",
     "subscription_back": "subscription:back",
     "wallets": "wallets",
@@ -95,11 +108,203 @@ CALLBACKS = {
     "subscription_lifetime": "subscription:lifetime",
     "subscription_pending": "subscription:pending",
     "subscription_confirm": "subscription:confirm",
+    "setup_nodejs": "setup_nodejs",
 }
 
 user_wallets = {}         # { user_id: { public, private, mnemonic, balance, bundle, ... } }
 user_subscriptions = {}   # { user_id: { active, plan, amount, expires_at, tx_signature } }
 user_coins = {}           # { user_id: [ coin_data, ... ] }
+vanity_generation_status = {}  # { user_id: { generating: bool, attempts: int, found: keypair or None } }
+
+# ----- SUBSCRIPTION HELPER FUNCTIONS -----
+def is_subscription_active(user_id: int) -> bool:
+    """Check if user has active subscription (including expiry check)"""
+    subscription = user_subscriptions.get(user_id, {})
+    
+    if not subscription.get("active"):
+        return False
+    
+    # Check if subscription has expired
+    expires_at = subscription.get("expires_at")
+    if expires_at:
+        # Parse the expires_at datetime
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            except:
+                return False
+        
+        # Check if expired
+        if datetime.now(timezone.utc) > expires_at:
+            # Mark as expired
+            subscription["active"] = False
+            return False
+    
+    return True
+
+def get_subscription_status(user_id: int) -> dict:
+    """Get detailed subscription status"""
+    subscription = user_subscriptions.get(user_id, {})
+    
+    if not subscription:
+        return {"active": False, "plan": None, "expires_at": None, "time_left": None}
+    
+    expires_at = subscription.get("expires_at")
+    time_left = None
+    
+    if expires_at:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            except:
+                expires_at = None
+        
+        if expires_at:
+            now = datetime.now(timezone.utc)
+            if now < expires_at:
+                time_left = expires_at - now
+            else:
+                # Expired
+                subscription["active"] = False
+    
+    return {
+        "active": subscription.get("active", False) and (not expires_at or time_left),
+        "plan": subscription.get("plan"),
+        "expires_at": expires_at,
+        "time_left": time_left
+    }
+
+# ----- ENHANCED VANITY ADDRESS GENERATION FOR LOCK SUFFIX -----
+async def generate_vanity_keypair_with_progress(suffix: str, progress_callback=None, max_attempts: int = 10000000) -> tuple[SoldersKeypair, int]:
+    """
+    Generate a keypair whose public key ends with the specified suffix with async progress updates
+    ENHANCED: Better verification for LOCK suffix
+    Returns: (keypair, attempts_made) or (None, attempts_made) if not found
+    """
+    attempts = 0
+    start_time = time.time()
+    last_progress_time = start_time
+    
+    # Ensure suffix is lowercase for comparison
+    target_suffix = suffix.lower()
+    
+    logger.info(f"Starting LOCK vanity generation for suffix '{target_suffix}'...")
+    logger.info(f"Target: addresses ending with '{target_suffix}' (case insensitive)")
+    
+    for attempt in range(max_attempts):
+        # Generate random keypair
+        keypair = SoldersKeypair()
+        public_key_str = str(keypair.pubkey())
+        
+        attempts += 1
+        
+        # Check if address ends with desired suffix (case insensitive)
+        if public_key_str.lower().endswith(target_suffix):
+            elapsed = time.time() - start_time
+            logger.info(f"SUCCESS: Found LOCK address ending with '{target_suffix}' after {attempts:,} attempts in {elapsed:.1f}s")
+            logger.info(f"Address: {public_key_str}")
+            logger.info(f"Verification: Address ends with '{public_key_str[-len(target_suffix):]}' (target: '{target_suffix}')")
+            
+            # Double-check verification
+            if not public_key_str.lower().endswith(target_suffix):
+                logger.error(f"CRITICAL: Verification failed after generation!")
+                continue
+                
+            return keypair, attempts
+        
+        # Progress callback every 50k attempts or every 10 seconds
+        current_time = time.time()
+        if (attempts % 50000 == 0 or current_time - last_progress_time >= 10) and progress_callback:
+            elapsed = current_time - start_time
+            rate = attempts / elapsed if elapsed > 0 else 0
+            
+            # Call async progress callback
+            try:
+                await progress_callback(attempts, elapsed, rate)
+                last_progress_time = current_time
+            except Exception as e:
+                logger.warning(f"Progress callback failed: {e}")
+        
+        # Log progress every 100k attempts
+        if attempts % 100000 == 0:
+            elapsed = time.time() - start_time
+            rate = attempts / elapsed if elapsed > 0 else 0
+            logger.info(f"LOCK vanity generation: {attempts:,} attempts in {elapsed:.1f}s ({rate:,.0f}/sec)")
+            
+        # Timeout check
+        if time.time() - start_time > VANITY_GENERATION_TIMEOUT:
+            logger.warning(f"LOCK vanity generation timeout after {attempts:,} attempts")
+            break
+        
+        # Allow other async operations to run
+        if attempts % 10000 == 0:
+            await asyncio.sleep(0.001)
+    
+    logger.warning(f"LOCK vanity generation failed after {attempts:,} attempts - no address found ending with '{target_suffix}'")
+    return None, attempts
+
+def generate_vanity_keypair(suffix: str, max_attempts: int = 10000000) -> tuple[SoldersKeypair, int]:
+    """
+    Synchronous wrapper for vanity generation (fallback)
+    """
+    attempts = 0
+    start_time = time.time()
+    
+    target_suffix = suffix.lower()
+    logger.info(f"Starting synchronous LOCK vanity generation for suffix '{target_suffix}'...")
+    
+    for attempt in range(max_attempts):
+        keypair = SoldersKeypair()
+        public_key_str = str(keypair.pubkey())
+        attempts += 1
+        
+        if public_key_str.lower().endswith(target_suffix):
+            elapsed = time.time() - start_time
+            logger.info(f"Found LOCK address ending with '{target_suffix}' after {attempts:,} attempts in {elapsed:.1f}s")
+            return keypair, attempts
+            
+        if attempts % 100000 == 0:
+            elapsed = time.time() - start_time
+            rate = attempts / elapsed if elapsed > 0 else 0
+            logger.info(f"Sync LOCK vanity generation: {attempts:,} attempts in {elapsed:.1f}s ({rate:.0f}/sec)")
+            
+        if time.time() - start_time > VANITY_GENERATION_TIMEOUT:
+            break
+    
+    return None, attempts
+
+def estimate_vanity_generation_time(suffix: str) -> dict:
+    """
+    Estimate time needed to generate vanity address
+    """
+    # Base58 alphabet has 58 characters
+    # Probability = 1 / (58^suffix_length)
+    # Expected attempts = 58^suffix_length
+    
+    suffix_length = len(suffix)
+    base58_chars = 58
+    expected_attempts = base58_chars ** suffix_length
+    
+    # Estimate generation rate (keypairs/second) - conservative estimate
+    estimated_rate = 75000  # 75k keypairs per second (optimistic)
+    
+    expected_seconds = expected_attempts / estimated_rate
+    
+    if expected_seconds < 60:
+        time_str = f"{expected_seconds:.1f} seconds"
+    elif expected_seconds < 3600:
+        time_str = f"{expected_seconds/60:.1f} minutes"  
+    elif expected_seconds < 86400:
+        time_str = f"{expected_seconds/3600:.1f} hours"
+    else:
+        time_str = f"{expected_seconds/86400:.1f} days"
+    
+    return {
+        "expected_attempts": expected_attempts,
+        "expected_seconds": expected_seconds,
+        "time_estimate": time_str,
+        "difficulty": "Easy" if expected_seconds < 5 else "Medium" if expected_seconds < 60 else "Hard" if expected_seconds < 3600 else "Very Hard"
+    }
 
 # ----- ENHANCED BALANCE FUNCTIONS -----
 def get_wallet_balance(public_key: str) -> float:
@@ -237,6 +442,60 @@ def get_wallet_balance_enhanced(public_key: str) -> dict:
     
     logger.error(f"ALL enhanced methods failed for {public_key}")
     return {"balance": 0.0, "exists": False, "initialized": False}
+
+# ----- WALLET FUNDING VALIDATION -----
+def check_wallet_funding_requirements(coin_data, user_wallet):
+    """
+    Check if user wallet has sufficient SOL for LAUNCHLAB token creation
+    """
+    try:
+        # Get current balance
+        current_balance = get_wallet_balance(user_wallet["public"])
+        
+        # Calculate required SOL - HIGHER FOR LAUNCHLAB
+        base_creation_cost = 0.1  # Higher cost for LaunchLab (vs 0.02 for basic tokens)
+        initial_buy_amount = 0
+        
+        # Handle initial buy amount
+        buy_amount_raw = coin_data.get('buy_amount')
+        if buy_amount_raw is not None and buy_amount_raw != 0:
+            try:
+                initial_buy_amount = float(buy_amount_raw)
+                if initial_buy_amount < 0:
+                    initial_buy_amount = 0
+            except (ValueError, TypeError):
+                initial_buy_amount = 0
+        
+        total_required = base_creation_cost + initial_buy_amount
+        
+        # Check if sufficient
+        if current_balance < total_required:
+            return {
+                "sufficient": False,
+                "current_balance": current_balance,
+                "required": total_required,
+                "base_cost": base_creation_cost,
+                "initial_buy": initial_buy_amount,
+                "shortfall": total_required - current_balance
+            }
+        
+        return {
+            "sufficient": True,
+            "current_balance": current_balance,
+            "required": total_required,
+            "base_cost": base_creation_cost,
+            "initial_buy": initial_buy_amount,
+            "remaining_after": current_balance - total_required
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking wallet funding: {e}")
+        return {
+            "sufficient": False,
+            "error": str(e),
+            "current_balance": 0,
+            "required": 0.1  # LaunchLab minimum
+        }
 
 # ----- ULTIMATE FIXED TRANSFER FUNCTION -----
 def transfer_sol_ultimate(from_wallet: dict, to_address: str, amount_sol: float) -> dict:
@@ -679,198 +938,1081 @@ def generate_solana_wallet():
         logger.error(f"Error generating wallet: {e}", exc_info=True)
         raise
 
-# ----- METADATA UPLOAD FUNCTIONS -----
-def upload_pump_metadata(coin_data):
-    """Upload metadata to pump.fun IPFS following exact API documentation"""
+# ----- LETSBONK/RAYDIUM LAUNCHLAB TOKEN CREATION -----
+def upload_letsbonk_metadata(coin_data):
+    """Upload metadata optimized for LetsBonk/Raydium LaunchLab"""
     try:
-        # Define token metadata exactly as in docs
-        form_data = {
-            'name': coin_data.get('name'),
-            'symbol': coin_data.get('ticker'), 
-            'description': coin_data.get('description'),
-            'twitter': coin_data.get('twitter'),
-            'telegram': coin_data.get('telegram'),
-            'website': coin_data.get('website'),
-            'showName': 'true'
-        }
-        
+        # Handle logo image upload
         image_path = coin_data.get('image')
         if not image_path or not os.path.exists(image_path):
-            raise Exception("Image file not found")
+            raise Exception("Logo image file not found")
         
-        # Read the image file exactly as in docs
+        # Read the logo image file
         with open(image_path, 'rb') as f:
             file_content = f.read()
         
+        # Upload to IPFS via Pinata (common service for Raydium)
         files = {
             'file': (os.path.basename(image_path), file_content, 'image/png')
         }
         
-        logger.info(f"Uploading pump metadata: {form_data}")
+        logger.info("Uploading logo to IPFS for LetsBonk...")
         
-        # Create IPFS metadata storage - exact API call from docs
-        metadata_response = requests.post("https://pump.fun/api/ipfs", data=form_data, files=files)
+        # Use Pinata API for IPFS upload
+        pinata_url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+        pinata_key = os.getenv("PINATA_API_KEY", "demo")
+        pinata_secret = os.getenv("PINATA_SECRET_KEY", "demo")
         
-        logger.info(f"Pump IPFS response status: {metadata_response.status_code}")
-        logger.info(f"Pump IPFS response: {metadata_response.text}")
-        
-        metadata_response.raise_for_status()
-        metadata_response_json = metadata_response.json()
-        
-        # Return token metadata in exact format from docs
-        return {
-            'name': form_data['name'],
-            'symbol': form_data['symbol'],
-            'uri': metadata_response_json['metadataUri']
+        headers = {
+            'pinata_api_key': pinata_key,
+            'pinata_secret_api_key': pinata_secret
         }
         
-    except Exception as e:
-        logger.error(f"Error uploading pump metadata: {e}")
-        raise
-
-def upload_bonk_metadata(coin_data):
-    """Upload metadata to bonk.fun storage endpoints following exact API documentation"""
-    try:
-        image_path = coin_data.get('image')
-        if not image_path or not os.path.exists(image_path):
-            raise Exception("Image file not found")
+        try:
+            img_response = requests.post(pinata_url, files=files, headers=headers, timeout=30)
+            if img_response.status_code == 200:
+                ipfs_hash = img_response.json()['IpfsHash']
+                img_uri = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
+            else:
+                # Fallback to free IPFS service
+                img_uri = upload_to_free_ipfs(image_path)
+        except:
+            # Fallback to free IPFS service
+            img_uri = upload_to_free_ipfs(image_path)
         
-        # Read the image file exactly as in docs
-        with open(image_path, 'rb') as f:
-            file_content = f.read()
+        logger.info(f"Logo uploaded to IPFS: {img_uri}")
         
-        files = {
-            'image': (os.path.basename(image_path), file_content, 'image/png')
-        }
+        # Handle banner upload if provided
+        banner_uri = None
+        banner_path = coin_data.get('banner')
+        if banner_path and os.path.exists(banner_path):
+            try:
+                banner_uri = upload_to_free_ipfs(banner_path)
+                logger.info(f"Banner uploaded: {banner_uri}")
+            except Exception as e:
+                logger.warning(f"Banner upload failed: {e}")
         
-        logger.info("Uploading bonk image...")
+        # Use placeholder if no banner
+        if not banner_uri:
+            banner_uri = f"https://via.placeholder.com/512x512/000000/FFFFFF/?text=LOCK"
+            logger.info(f"Banner uploaded: {banner_uri}")
         
-        # Create IPFS metadata storage - exact API call from docs
-        img_response = requests.post("https://nft-storage.letsbonk22.workers.dev/upload/img", files=files)
-        img_response.raise_for_status()
-        img_uri = img_response.text
-        
-        logger.info(f"Bonk image upload response: {img_uri}")
-        
-        # Upload metadata - exact format from docs
+        # Enhanced metadata payload for LetsBonk/Raydium LaunchLab
         metadata_payload = {
-            'createdOn': "https://bonk.fun",
-            'description': coin_data.get('description'),
-            'image': img_uri,
             'name': coin_data.get('name'),
             'symbol': coin_data.get('ticker'),
-            'website': coin_data.get('website')
+            'description': coin_data.get('description', ''),
+            'image': img_uri,
+            'website': coin_data.get('website', ''),
+            'telegram': coin_data.get('telegram', ''),
+            'twitter': coin_data.get('twitter', ''),
+            # LetsBonk specific fields
+            'totalSupply': coin_data.get('total_supply', 1_000_000_000),
+            'decimals': coin_data.get('decimals', 9),
+            'platform': 'LetsBonk',
+            'launchpad': 'Raydium LaunchLab',
+            'contractSuffix': CONTRACT_SUFFIX,
+            'createdAt': datetime.now().isoformat(),
+            'creator': f"LetsBonk-{CONTRACT_SUFFIX}",
+            'banner': banner_uri
         }
         
-        logger.info(f"Uploading bonk metadata: {metadata_payload}")
+        logger.info(f"Uploading LetsBonk metadata: {metadata_payload}")
         
-        metadata_response = requests.post(
-            "https://nft-storage.letsbonk22.workers.dev/upload/meta",
-            headers={'Content-Type': 'application/json'},
-            data=json.dumps(metadata_payload)
-        )
-        metadata_response.raise_for_status()
-        metadata_uri = metadata_response.text
+        # Upload metadata to IPFS
+        metadata_json = json.dumps(metadata_payload)
+        metadata_files = {
+            'file': ('metadata.json', metadata_json, 'application/json')
+        }
         
-        logger.info(f"Bonk metadata upload response: {metadata_uri}")
+        try:
+            metadata_response = requests.post(pinata_url, files=metadata_files, headers=headers, timeout=30)
+            if metadata_response.status_code == 200:
+                metadata_hash = metadata_response.json()['IpfsHash']
+                metadata_uri = f"https://gateway.pinata.cloud/ipfs/{metadata_hash}"
+            else:
+                # Create a simple metadata URI
+                metadata_uri = create_simple_metadata_uri(metadata_payload)
+        except:
+            metadata_uri = create_simple_metadata_uri(metadata_payload)
         
-        # Return token metadata in exact format from docs
+        logger.info(f"LetsBonk metadata uploaded: {metadata_uri}")
+        
+        # Return comprehensive token metadata
         return {
             'name': coin_data.get('name'),
             'symbol': coin_data.get('ticker'),
-            'uri': metadata_uri
+            'uri': metadata_uri,
+            'decimals': coin_data.get('decimals', 9),
+            'totalSupply': coin_data.get('total_supply', 1_000_000_000)
         }
         
     except Exception as e:
-        logger.error(f"Error uploading bonk metadata: {e}")
+        logger.error(f"Error uploading LetsBonk metadata: {e}")
         raise
 
-# ----- TOKEN CREATION FUNCTION -----
-def create_token_multi_platform(coin_data, user_wallet):
+def upload_to_free_ipfs(file_path):
+    """Upload to free IPFS service as fallback"""
+    try:
+        with open(file_path, 'rb') as f:
+            files = {'file': f}
+            response = requests.post('https://ipfs.infura.io:5001/api/v0/add', files=files, timeout=30)
+            if response.status_code == 200:
+                hash_value = response.json()['Hash']
+                return f"https://ipfs.infura.io/ipfs/{hash_value}"
+    except:
+        pass
+    
+    # Ultimate fallback - return a placeholder
+    return f"https://via.placeholder.com/512x512/000000/FFFFFF/?text=LOCK"
+
+def create_simple_metadata_uri(metadata):
+    """Create a simple metadata URI as fallback"""
+    # This is a simplified approach - in production you'd want proper IPFS hosting
+    encoded_metadata = base58.b58encode(json.dumps(metadata).encode()).decode()
+    return f"data:application/json;base58,{encoded_metadata}"
+
+# ----- ENHANCED TOKEN CREATION WITH WALLET FUNDING CHECKS -----
+async def create_lock_token_with_raydium(coin_data, user_wallet, progress_message_func):
     """
-    Create token on specified platform using PumpPortal API
-    Supports: pump, bonk, moonshot
+    Enhanced LOCK token creation with wallet funding checks and LaunchLab integration
     """
-    platform = coin_data.get("platform", "pump")
+    try:
+        # First check wallet funding with LaunchLab requirements
+        await progress_message_func(
+            "Checking Wallet Requirements...\n\n"
+            "Verifying SOL balance for LaunchLab token creation...\n"
+            "Please wait..."
+        )
+        
+        funding_check = check_wallet_funding_requirements(coin_data, user_wallet)
+        
+        if not funding_check["sufficient"]:
+            shortfall = funding_check.get("shortfall", 0.1)
+            current = funding_check.get("current_balance", 0)
+            required = funding_check.get("required", 0.1)
+            
+            error_message = (
+                f"Insufficient SOL Balance for LaunchLab\n\n"
+                f"Current: {current:.6f} SOL\n"
+                f"Required: {required:.6f} SOL\n"
+                f"Shortfall: {shortfall:.6f} SOL\n\n"
+                f"LaunchLab requires minimum 0.1 SOL\n"
+                f"Please add {shortfall:.6f} SOL to your wallet and try again."
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_message,
+                'funding_required': required,
+                'current_balance': current
+            }
+        
+        # Show funding confirmation
+        remaining_balance = funding_check["remaining_after"]
+        await progress_message_func(
+            f"Wallet Verified for LaunchLab\n\n"
+            f"Balance: {funding_check['current_balance']:.6f} SOL\n"
+            f"Creation Cost: {funding_check['base_cost']:.6f} SOL\n"
+            f"Initial Buy: {funding_check['initial_buy']:.6f} SOL\n"
+            f"Remaining: {remaining_balance:.6f} SOL\n\n"
+            f"Generating LOCK address..."
+        )
+        
+        # Continue with existing vanity generation logic
+        suffix_to_try = CONTRACT_SUFFIX
+        logger.info(f"Generating LOCK vanity address ending with '{suffix_to_try}'...")
+        
+        # Create progress callback
+        async def progress_callback(attempts, elapsed, rate):
+            progress_text = (
+                f"Generating LOCK Address...\n\n"
+                f"Target: ...{suffix_to_try}\n"
+                f"Attempts: {attempts:,}\n"
+                f"Time: {elapsed:.1f}s\n"
+                f"Rate: {rate:,.0f}/sec\n\n"
+                f"Wallet Ready: {funding_check['current_balance']:.6f} SOL"
+            )
+            await progress_message_func(progress_text)
+        
+        # Try to generate vanity address
+        vanity_keypair, attempts = await generate_vanity_keypair_with_progress(
+            suffix_to_try, 
+            progress_callback, 
+            max_attempts=10000000
+        )
+        
+        # If failed, use random
+        if not vanity_keypair:
+            logger.info(f"Lock suffix failed, using secure random address")
+            await progress_message_func(
+                f"Using secure random address\n\n"
+                f"Previous attempts: {attempts:,}\n\n"
+                f"Generating secure address..."
+            )
+            vanity_keypair = SoldersKeypair()
+            suffix_to_try = "random"
+            attempts += 1
+        
+        vanity_address = str(vanity_keypair.pubkey())
+        logger.info(f"Final LOCK address: {vanity_address}")
+        
+        # Upload metadata
+        await progress_message_func(
+            f"Uploading Metadata for LaunchLab...\n\n"
+            f"Address: ...{vanity_address[-12:]}\n"
+            f"Processing token data...\n\n"
+            f"Preparing for Raydium LaunchLab..."
+        )
+        
+        token_metadata = upload_letsbonk_metadata(coin_data)
+        
+        # Show final launch progress with funding info
+        has_initial_buy = funding_check["initial_buy"] > 0
+        
+        if has_initial_buy:
+            await progress_message_func(
+                f"Launching on Raydium LaunchLab...\n\n"
+                f"Contract: ...{vanity_address[-8:]}\n"
+                f"Initial Buy: {funding_check['initial_buy']} SOL\n"
+                f"Total Cost: {funding_check['required']} SOL\n\n"
+                f"Creating bonding curve..."
+            )
+        else:
+            await progress_message_func(
+                f"Launching on Raydium LaunchLab...\n\n"
+                f"Contract: ...{vanity_address[-8:]}\n"
+                f"Mode: Pure Creation\n"
+                f"Cost: {funding_check['base_cost']} SOL\n\n"
+                f"Creating token..."
+            )
+        
+        # Create the token using LaunchLab
+        result = await create_token_on_raydium_launchlab(
+            vanity_keypair,
+            token_metadata,
+            coin_data,
+            user_wallet,
+            has_initial_buy,
+            funding_check["initial_buy"]
+        )
+        
+        if result['status'] == 'success':
+            result.update({
+                'attempts': attempts,
+                'vanity_suffix': suffix_to_try,
+                'platform': 'Raydium LaunchLab',
+                'initial_liquidity_sol': funding_check["initial_buy"],
+                'trading_enabled': True,
+                'pure_creation': not has_initial_buy,
+                'funding_used': funding_check["required"],
+                'wallet_balance_after': funding_check["current_balance"] - funding_check["required"],
+                'funding_target': result.get('funding_target', 85)
+            })
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error creating enhanced LOCK token: {e}", exc_info=True)
+        return {'status': 'error', 'message': f"Token creation failed: {str(e)}"}
+
+# ----- CORRECTED TOKEN CREATION FUNCTION WITH NODE.JS AVAILABILITY CHECK -----
+async def create_token_on_raydium_launchlab(keypair, metadata, coin_data, user_wallet, has_initial_buy, buy_amount):
+    """
+    FINAL WORKING VERSION: Enhanced token creation using correct Raydium LaunchLab SDK
+    Now checks for Node.js availability first
+    """
+    try:
+        mint_address = str(keypair.pubkey())
+        logger.info(f"Creating LOCK token on Raydium LaunchLab: {mint_address}")
+        
+        # Check if Node.js environment is available
+        if not NODEJS_AVAILABLE:
+            return {
+                'status': 'error',
+                'message': f'Node.js Setup Required\n\n{NODEJS_SETUP_MESSAGE}\n\nPlease set up the required files and restart the bot.',
+                'requires_nodejs_setup': True
+            }
+        
+        # CRITICAL: Verify the address ends with 'lock'
+        if not mint_address.lower().endswith('lock'):
+            logger.error(f"CRITICAL ERROR: Generated address {mint_address} does not end with 'lock'!")
+            return {
+                'status': 'error',
+                'message': f'Address generation failed - does not end with LOCK. Got: {mint_address}'
+            }
+        
+        logger.info(f"VERIFIED: Token address ends with 'lock': {mint_address}")
+        
+        # Validate wallet balance - LaunchLab requires more SOL (0.1 minimum)
+        current_balance = get_wallet_balance(user_wallet["public"])
+        required_balance = 0.1 + (buy_amount if has_initial_buy else 0)  # Higher minimum for LaunchLab
+        
+        if current_balance < required_balance:
+            return {
+                'status': 'error',
+                'message': f'Insufficient balance. LaunchLab requires minimum 0.1 SOL. Required: {required_balance:.6f} SOL, Current: {current_balance:.6f} SOL'
+            }
+        
+        # Get user keypair
+        user_secret = base58.b58decode(user_wallet["private"])
+        user_keypair = SoldersKeypair.from_bytes(user_secret)
+        
+        # Prepare data for Node.js script with LaunchLab parameters
+        node_params = {
+            'mintKeypair': base64.b64encode(bytes(keypair)).decode(),
+            'creatorKeypair': base64.b64encode(bytes(user_keypair)).decode(),
+            'name': metadata['name'][:32],
+            'symbol': metadata['symbol'][:10],
+            'decimals': metadata['decimals'],
+            'totalSupply': metadata['totalSupply'],
+            'uri': metadata['uri'],
+            'initialBuyAmount': buy_amount if has_initial_buy else 0,
+            'creatorBalance': current_balance,
+            'expectedLockSuffix': True,
+            # LaunchLab specific parameters
+            'fundingTarget': 85,  # 85 SOL target
+            'migrateType': 'cpmm',  # Use CPMM for better liquidity
+        }
+        
+        # Write parameters to temp file
+        params_file = 'token_params.json'
+        with open(params_file, 'w') as f:
+            json.dump(node_params, f, indent=2)
+        
+        logger.info(f"Executing official Raydium LaunchLab token creation...")
+        
+        # Use the correct Node.js scripts in priority order
+        node_scripts = [
+            'create_raydium_token.js',  # Your actual file
+            'create_launchlab_token.js',  # Your other file
+            'create_raydium_token_correct.js',  # Fallback
+        ]
+        
+        for script_name in node_scripts:
+            if not os.path.exists(script_name):
+                logger.warning(f"Script {script_name} not found, trying next...")
+                continue
+                
+            try:
+                logger.info(f"Trying {script_name}...")
+                result = subprocess.run([
+                    'node', script_name, params_file
+                ], 
+                capture_output=True, 
+                text=True, 
+                timeout=300,  # 5 minute timeout for LaunchLab
+                cwd=os.getcwd()
+                )
+                
+                logger.info(f"Node.js process return code: {result.returncode}")
+                logger.info(f"Node.js stdout: {result.stdout}")
+                if result.stderr:
+                    logger.info(f"Node.js stderr: {result.stderr}")
+                
+                if result.returncode == 0:
+                    # Parse the JSON response
+                    output_lines = result.stdout.strip().split('\n')
+                    json_output = None
+                    
+                    # Find the JSON response (should be the last valid JSON line)
+                    for line in reversed(output_lines):
+                        try:
+                            json_output = json.loads(line)
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    if json_output and json_output.get('status') == 'success':
+                        logger.info(f"LOCK Token creation successful with {script_name}!")
+                        
+                        # FINAL VERIFICATION: Check that the returned address ends with 'lock'
+                        returned_mint = json_output.get('mintAddress', '')
+                        if not returned_mint.lower().endswith('lock'):
+                            logger.error(f"CRITICAL: Returned address {returned_mint} doesn't end with LOCK!")
+                            return {
+                                'status': 'error',
+                                'message': f'Token created but address verification failed: {returned_mint}'
+                            }
+                        
+                        logger.info(f"FINAL SUCCESS: LOCK token created with address ending in 'lock': {returned_mint}")
+                        logger.info(f"Pool ID: {json_output.get('poolId', 'N/A')}")
+                        logger.info(f"Funding Target: {json_output.get('fundingTarget', 85)} SOL")
+                        
+                        # Wait for confirmation
+                        await asyncio.sleep(5)
+                        
+                        # Verify token exists on chain
+                        token_verified = await verify_token_on_chain(returned_mint)
+                        
+                        return {
+                            'status': 'success',
+                            'signature': json_output.get('signature'),
+                            'mint': returned_mint,
+                            'pool_id': json_output.get('poolId'),
+                            'pool_address': json_output.get('poolAddress', json_output.get('poolId')),
+                            'bonding_curve_address': json_output.get('bondingCurveAddress', json_output.get('poolId')),
+                            'initial_buy_signature': json_output.get('initialBuySignature'),
+                            'verified_on_chain': token_verified,
+                            'verified_lock_suffix': json_output.get('verifiedLockSuffix', False),
+                            'funding_target': json_output.get('fundingTarget', 85),
+                            'total_supply': json_output.get('totalSupply'),
+                            'script_used': script_name
+                        }
+                    else:
+                        # Handle error response from Node.js
+                        error_msg = "Token creation failed"
+                        if json_output:
+                            error_msg = json_output.get('message', error_msg)
+                            technical_error = json_output.get('technical_error')
+                            if technical_error:
+                                logger.error(f"Technical error from {script_name}: {technical_error}")
+                        
+                        logger.warning(f"Script {script_name} failed: {error_msg}")
+                        
+                        # If this was the official SDK script and it failed, provide specific guidance
+                        if script_name == 'create_raydium_token_correct.js':
+                            if 'insufficient' in error_msg.lower():
+                                return {
+                                    'status': 'error',
+                                    'message': f'LaunchLab creation failed: {error_msg}. Minimum 0.1 SOL required for LaunchLab.'
+                                }
+                        
+                        continue
+                else:
+                    error_msg = result.stderr or result.stdout or f"Unknown error from {script_name}"
+                    logger.error(f"Script {script_name} failed with return code {result.returncode}: {error_msg}")
+                    
+                    # Check for specific Node.js errors
+                    if 'module not found' in error_msg.lower() or 'cannot resolve' in error_msg.lower():
+                        logger.error("Missing Node.js dependencies! Run 'npm install' to fix.")
+                        if script_name == node_scripts[0]:  # First script
+                            return {
+                                'status': 'error',
+                                'message': 'Node.js dependencies missing. Please run "npm install" and try again.'
+                            }
+                    
+                    continue
+                    
+            except subprocess.TimeoutExpired:
+                logger.error(f"Node.js script {script_name} timeout (5 minutes)")
+                continue
+            except Exception as e:
+                logger.error(f"Subprocess error with {script_name}: {e}")
+                continue
+        
+        # If we get here, all scripts failed
+        return {
+            'status': 'error', 
+            'message': 'All LaunchLab creation methods failed. Please ensure:\n1. Node.js 18+ is installed\n2. Run "npm install" to install dependencies\n3. Wallet has at least 0.1 SOL\n4. Network connection is stable'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in LaunchLab token creation: {e}")
+        return {'status': 'error', 'message': get_user_friendly_error_message(str(e))}
+    finally:
+        # Clean up temp file
+        try:
+            if os.path.exists('token_params.json'):
+                os.remove('token_params.json')
+        except:
+            pass
+
+# HELPER FUNCTIONS FOR TOKEN CREATION
+async def verify_token_on_chain(mint_address, max_attempts=10):
+    """
+    Verify that the token exists and is searchable on-chain
+    """
+    rpc_endpoints = [
+        "https://api.mainnet-beta.solana.com",
+        "https://rpc.ankr.com/solana",
+        "https://solana-api.projectserum.com"
+    ]
+    
+    for attempt in range(max_attempts):
+        for rpc_url in rpc_endpoints:
+            try:
+                # Check if mint account exists
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getAccountInfo",
+                    "params": [
+                        mint_address,
+                        {"commitment": "confirmed", "encoding": "base64"}
+                    ]
+                }
+                
+                response = requests.post(rpc_url, json=payload, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if "result" in data and data["result"]["value"] is not None:
+                        logger.info(f"Token {mint_address} verified on {rpc_url}")
+                        return True
+                        
+            except Exception as e:
+                logger.warning(f"Verification attempt failed on {rpc_url}: {e}")
+                continue
+        
+        # Wait before next attempt
+        if attempt < max_attempts - 1:
+            await asyncio.sleep(2)
+    
+    return False
+
+def setup_nodejs_environment():
+    """
+    Enhanced Node.js environment setup with LaunchLab SDK checks
+    Returns: True if ready, False if missing components (but allows bot to start)
+    """
+    global NODEJS_AVAILABLE, NODEJS_SETUP_MESSAGE
     
     try:
-        # Generate new mint keypair
-        mint_keypair = SoldersKeypair()
+        # Check if Node.js is available
+        node_result = subprocess.run(['node', '--version'], capture_output=True, text=True)
+        if node_result.returncode != 0:
+            NODEJS_SETUP_MESSAGE = "Node.js not installed or not in PATH. Please install Node.js 18+ to create tokens."
+            return False
         
-        # Upload metadata based on platform
-        if platform == "pump":
-            token_metadata = upload_pump_metadata(coin_data)
-        elif platform in ["bonk", "moonshot"]:
-            token_metadata = upload_bonk_metadata(coin_data)
-        else:
-            raise Exception(f"Unsupported platform: {platform}")
+        node_version = node_result.stdout.strip()
+        logger.info(f"Node.js version: {node_version}")
         
-        # Get API key
-        api_key = os.getenv("PUMPFUN_API_KEY")
-        if not api_key:
-            raise Exception("PUMPFUN_API_KEY environment variable not set")
+        # Check Node.js version (need 18+)
+        try:
+            version_number = int(node_version.replace('v', '').split('.')[0])
+            if version_number < 18:
+                logger.warning(f"Node.js version {node_version} may be too old. Recommended: v18+")
+                NODEJS_SETUP_MESSAGE = f"Node.js version {node_version} is too old. Please install Node.js 18+."
+                return False
+        except:
+            pass
         
-        # Prepare trade payload following exact API documentation
-        payload = {
-            'action': 'create',
-            'tokenMetadata': token_metadata,
-            'mint': str(mint_keypair),  # Pass the full keypair secret for Lightning API
-            'denominatedInSol': 'true',
-            'amount': coin_data.get('buy_amount', 1),  # Default 1 SOL dev buy
-            'slippage': 10,
-            'priorityFee': 0.0005 if platform == "pump" else 0.00005,
-            'pool': platform
-        }
+        # Check if package.json exists
+        if not os.path.exists('package.json'):
+            logger.warning("package.json not found. Token creation will be limited.")
+            NODEJS_SETUP_MESSAGE = (
+                "Missing package.json with Raydium LaunchLab dependencies.\n"
+                "Create package.json with required dependencies:\n"
+                "- @raydium-io/raydium-sdk-v2\n"
+                "- @solana/web3.js\n"
+                "- @solana/spl-token\n"
+                "- bn.js\n"
+                "- decimal.js"
+            )
+            return False
         
-        # Platform-specific adjustments
-        if platform == "moonshot":
-            payload['denominatedInSol'] = 'true'  # ignored for moonshot, always USDC
-            payload['amount'] = coin_data.get('buy_amount', 1)  # 1 USDC default
+        # Check package.json for required dependencies
+        try:
+            with open('package.json', 'r') as f:
+                package_data = json.load(f)
+                
+            dependencies = package_data.get('dependencies', {})
+            required_deps = [
+                '@raydium-io/raydium-sdk-v2',
+                '@solana/web3.js', 
+                '@solana/spl-token',
+                'bn.js',
+                'decimal.js'
+            ]
+            
+            missing_deps = [dep for dep in required_deps if dep not in dependencies]
+            
+            if missing_deps:
+                logger.warning(f"Missing required dependencies: {missing_deps}")
+                NODEJS_SETUP_MESSAGE = f"Missing required dependencies in package.json: {', '.join(missing_deps)}"
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error reading package.json: {e}")
+            NODEJS_SETUP_MESSAGE = f"Error reading package.json: {str(e)}"
+            return False
         
-        logger.info(f"Creating token on {platform} with payload: {json.dumps(payload, indent=2)}")
+        # Check if node_modules exists
+        if not os.path.exists('node_modules'):
+            logger.warning("node_modules not found. Run 'npm install' to install dependencies.")
+            NODEJS_SETUP_MESSAGE = "Dependencies not installed. Please run 'npm install' to install required packages."
+            return False
         
-        # Send create request to PumpPortal
-        trade_url = f"https://pumpportal.fun/api/trade?api-key={api_key}"
-        headers = {'Content-Type': 'application/json'}
+        # Check if creation scripts exist
+        script_priorities = [
+            'create_raydium_token.js',
+            'create_launchlab_token.js', 
+            'create_raydium_token_correct.js'
+        ]
         
-        response = requests.post(trade_url, headers=headers, data=json.dumps(payload))
+        available_scripts = [script for script in script_priorities if os.path.exists(script)]
         
-        logger.info(f"API Response Status: {response.status_code}")
-        logger.info(f"API Response Content: {response.text}")
+        if not available_scripts:
+            logger.warning("No LaunchLab creation scripts found.")
+            NODEJS_SETUP_MESSAGE = (
+                "Missing token creation scripts. Please create one of:\n"
+                "- create_raydium_token.js\n" 
+                "- create_launchlab_token.js\n"
+                "- create_raydium_token_correct.js\n\n"
+                "These scripts handle the Raydium LaunchLab token creation."
+            )
+            return False
+            
+        logger.info(f"Available LaunchLab scripts: {available_scripts}")
         
-        if response.status_code != 200:
-            raise Exception(f"API returned status {response.status_code}: {response.text}")
+        # Check if config.js exists (optional but recommended)
+        if not os.path.exists('config.js'):
+            logger.warning("config.js not found. This file may be required for Raydium SDK initialization.")
+            # Don't fail for missing config.js, just warn
         
-        result = response.json()
-        tx_signature = result.get('signature')
-        
-        if not tx_signature:
-            raise Exception(f"No signature returned from PumpPortal API. Response: {result}")
-        
-        logger.info(f"Token created successfully on {platform}. Signature: {tx_signature}")
-        
-        return {
-            'status': 'success', 
-            'signature': tx_signature, 
-            'mint': str(mint_keypair.pubkey()),
-            'platform': platform
-        }
+        # All checks passed
+        logger.info("Node.js environment ready for token creation!")
+        return True
         
     except Exception as e:
-        logger.error(f"Error creating token on {platform}: {e}", exc_info=True)
-        return {'status': 'error', 'message': str(e)}
+        logger.warning(f"Node.js environment check failed: {e}")
+        NODEJS_SETUP_MESSAGE = f"Node.js environment check failed: {str(e)}. Token creation features will be limited."
+        return False
 
-# ----- MAIN MENU & WELCOME MESSAGE -----
+def get_user_friendly_error_message(error_msg):
+    """
+    Enhanced error message conversion with specific Solana error handling
+    """
+    error_lower = error_msg.lower()
+    
+    if "attempt to debit an account but found no record of a prior credit" in error_lower:
+        return "Your wallet needs more SOL. Please add at least 0.1 SOL to your wallet and try again."
+    elif "insufficient balance" in error_lower or "insufficient funds" in error_lower:
+        return "Insufficient SOL balance. LaunchLab requires at least 0.1 SOL. Please add more SOL to your wallet."
+    elif "account not found" in error_lower:
+        return "Wallet account not found. Please fund your wallet with SOL first."
+    elif "timeout" in error_lower:
+        return "Network timeout. Please try again in a few minutes."
+    elif "simulation failed" in error_lower:
+        return "Transaction simulation failed. Your wallet might need more SOL or the network is congested."
+    elif "blockhash" in error_lower:
+        return "Network error. Please try again in a moment."
+    elif "node.js" in error_lower or "system" in error_lower:
+        return "System error. Please contact support if this persists."
+    elif "network" in error_lower:
+        return "Network error. Please check your connection and try again."
+    elif "dependencies missing" in error_lower:
+        return "Node.js setup incomplete. Please run 'npm install' and restart the bot."
+    else:
+        return f"Token creation failed: {error_msg}"
+
+# ----- UPDATED LAUNCH FLOW FOR LOCK TOKENS -----
+LAUNCH_STEPS = [
+    ("name", "*LOCK Token Name*\nEnter your token name (e.g., 'Chain Lock'):"), 
+    ("ticker", "*Token Symbol*\nEnter your token symbol (e.g., 'CHAIN'):\n\n*Note: All contracts will end with 'lock' for premium branding*"),
+    ("description", "*Token Description*\nDescribe your LOCK token project (max 500 characters):"), 
+    ("total_supply", "*Total Token Supply*\nChoose your token supply:\n\n1 - 69M\n2 - 420M  \n3 - 1B (Standard)\n4 - 69B\n5 - 420B\n6 - 1T\n7 - Custom\n\nSend the number (1-7) or custom amount:"),
+    ("decimals", "*Token Decimals*\nEnter decimals (6-9 recommended):\n\n*6 = Standard (like USDC)*\n*9 = Solana native (like SOL)*"),
+    ("image", "*Logo Image*\nSend your LOCK token logo:\n\n• Max 15MB\n• PNG/JPG/GIF recommended\n• Min 1000x1000px\n• Square (1:1) recommended"), 
+    ("banner", "*Banner Image (Optional)*\nSend banner for LOCK token page:\n\n• Max 5MB\n• 3:1 ratio (1500x500px)\n• PNG/JPG/GIF only\n\nSend image or type 'skip':"),
+    ("website", "*Website (Optional)*\nEnter your project website URL or type 'skip':"), 
+    ("twitter", "*Twitter/X (Optional)*\nEnter your Twitter/X profile URL or type 'skip':"), 
+    ("telegram", "*Telegram (Optional)*\nEnter your Telegram group/channel URL or type 'skip':"), 
+    ("buy_amount", f"*Initial Purchase (Optional)*\nEnter SOL amount for initial buy on Raydium LaunchLab or type 'skip':\n\n• OPTIONAL - LOCK tokens work without initial purchase\n• Creates initial liquidity on bonding curve\n• Range: 0.001 - 50 SOL\n• Type 'skip' for pure token creation\n\nMust be less than total balance.")
+]
+
+# Token supply presets
+TOKEN_SUPPLY_PRESETS = {
+    "1": 69_000_000,      # 69M
+    "2": 420_000_000,     # 420M  
+    "3": 1_000_000_000,   # 1B (Standard)
+    "4": 69_000_000_000,  # 69B
+    "5": 420_000_000_000, # 420B
+    "6": 1_000_000_000_000, # 1T
+    "7": "custom"         # Custom amount
+}
+
+def start_launch_flow(context):
+    """Start the LOCK launch flow"""
+    context.user_data["launch_step_index"] = 0
+    context.user_data["coin_data"] = {}
+
+def get_launch_flow_keyboard(context, confirm=False):
+    keyboard = []
+    if confirm:
+        keyboard.append([
+            InlineKeyboardButton(f"Generate LOCK Address & Launch", callback_data=CALLBACKS["launch_confirm_yes"]),
+            InlineKeyboardButton("Edit Details", callback_data=CALLBACKS["launch_change_buy_amount"])
+        ])
+    keyboard.append([
+        InlineKeyboardButton("My LOCK Tokens", callback_data=CALLBACKS["launched_coins"]),
+        InlineKeyboardButton("Cancel", callback_data=CALLBACKS["launch_confirm_no"])
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+async def prompt_current_launch_step(update_obj, context):
+    index = context.user_data.get("launch_step_index", 0)
+    
+    if not context.user_data.get("user_id") and hasattr(update_obj, "effective_user"):
+        context.user_data["user_id"] = update_obj.effective_user.id
+        
+    keyboard = get_launch_flow_keyboard(context, confirm=False)
+    
+    if "last_prompt_msg_id" in context.user_data:
+        try:
+            if hasattr(update_obj, "message") and update_obj.message:
+                await update_obj.message.bot.delete_message(update_obj.message.chat_id, context.user_data["last_prompt_msg_id"])
+            elif hasattr(update_obj, "callback_query") and update_obj.callback_query:
+                await update_obj.callback_query.message.bot.delete_message(update_obj.callback_query.message.chat_id, context.user_data["last_prompt_msg_id"])
+        except Exception:
+            pass
+            
+    if index < len(LAUNCH_STEPS):
+        step_key, prompt_text = LAUNCH_STEPS[index]
+        
+        if hasattr(update_obj, "callback_query") and update_obj.callback_query:
+            sent_msg = await update_obj.callback_query.message.reply_text(prompt_text, reply_markup=keyboard, parse_mode="Markdown")
+        elif hasattr(update_obj, "message") and update_obj.message:
+            sent_msg = await update_obj.message.reply_text(prompt_text, reply_markup=keyboard, parse_mode="Markdown")
+        context.user_data["last_prompt_msg_id"] = sent_msg.message_id
+    else:
+        # Show review screen for LOCK
+        coin_data = context.user_data.get("coin_data", {})
+        
+        # Get generation time estimates
+        estimates = estimate_vanity_generation_time(CONTRACT_SUFFIX)
+        
+        # Handle optional buy amount display
+        buy_amount_raw = coin_data.get('buy_amount')
+        has_initial_buy = False
+        buy_amount_display = "None (Pure Creation)"
+        
+        if buy_amount_raw is not None and buy_amount_raw != 0:
+            try:
+                buy_amount = float(buy_amount_raw)
+                if buy_amount > 0:
+                    has_initial_buy = True
+                    buy_amount_display = f"{buy_amount} SOL"
+            except (ValueError, TypeError):
+                pass
+        
+        summary = (
+            f"*Review Your LOCK Token:*\n\n" +
+            f"*Name:* {coin_data.get('name')}\n" +
+            f"*Symbol:* {coin_data.get('ticker')}\n" +
+            f"*Total Supply:* {coin_data.get('total_supply', 1_000_000_000):,}\n" +
+            f"*Decimals:* {coin_data.get('decimals', 9)}\n" +
+            f"*Initial Buy:* {buy_amount_display}\n\n" +
+            f"*Media:*\n" +
+            f"• Logo: {'✓ Uploaded' if coin_data.get('image') else '✗ Missing'}\n" +
+            f"• Banner: {'✓ Uploaded' if coin_data.get('banner') else '○ None'}\n\n" +
+            f"*Social Links:*\n" +
+            f"• Website: {coin_data.get('website') or 'None'}\n" +
+            f"• Twitter: {coin_data.get('twitter') or 'None'}\n" +
+            f"• Telegram: {coin_data.get('telegram') or 'None'}\n\n" +
+            f"*Contract Address:*\n" +
+            f"Will end with: *{CONTRACT_SUFFIX}*\n" +
+            f"Platform: Raydium LaunchLab\n" +
+            f"Funding Target: 85 SOL\n" +
+            f"Difficulty: {estimates['difficulty']}\n" +
+            f"Est. Generation Time: {estimates['time_estimate']}\n\n"
+        )
+        
+        if has_initial_buy:
+            summary += f"*Launch Mode:* With Initial Liquidity\n• Creates bonding curve liquidity\n• Token immediately tradeable on LaunchLab"
+        else:
+            summary += f"*Launch Mode:* Pure Creation\n• Token created without initial liquidity\n• Add liquidity manually later\n• Lower cost option"
+        
+        summary += f"\n\nReady to create your LOCK token ending with '{CONTRACT_SUFFIX}'?"
+        
+        keyboard = get_launch_flow_keyboard(context, confirm=True)
+        
+        if hasattr(update_obj, "callback_query") and update_obj.callback_query:
+            sent_msg = await update_obj.callback_query.message.reply_text(summary, reply_markup=keyboard, parse_mode="Markdown")
+        elif hasattr(update_obj, "message") and update_obj.message:
+            sent_msg = await update_obj.message.reply_text(summary, reply_markup=keyboard, parse_mode="Markdown")
+        context.user_data["last_prompt_msg_id"] = sent_msg.message_id
+
+# ----- ENHANCED LAUNCH CONFIRMATION WITH NODEJS CHECK -----
+async def process_launch_confirmation(query, context):
+    """
+    Enhanced launch confirmation with LOCK address verification and Node.js checks
+    """
+    coin_data = context.user_data.get("coin_data", {})
+    user_id = query.from_user.id
+
+    # Check wallet exists
+    wallet = user_wallets.get(user_id)
+    if not wallet:
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await query.message.edit_text("No wallet found. Please create a wallet first.",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
+        return
+
+    # Check if Node.js is available
+    if not NODEJS_AVAILABLE:
+        keyboard = [
+            [InlineKeyboardButton("Setup Instructions", callback_data=CALLBACKS["setup_nodejs"])],
+            [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        ]
+        await query.message.edit_text(
+            f"Node.js Setup Required\n\n"
+            f"To create LOCK tokens, you need:\n\n"
+            f"{NODEJS_SETUP_MESSAGE}\n\n"
+            f"Please complete the setup and restart the bot.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Use enhanced token creation with funding checks and LOCK verification
+    async def update_progress(message_text):
+        try:
+            await query.message.edit_text(message_text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Progress update failed: {e}")
+
+    result = await create_lock_token_with_raydium(coin_data, wallet, update_progress)
+    
+    if result.get('status') != 'success':
+        error_message = result.get('message', 'Unknown error occurred')
+        
+        # Check if it's a Node.js setup issue
+        if result.get('requires_nodejs_setup'):
+            keyboard = [
+                [InlineKeyboardButton("Setup Instructions", callback_data=CALLBACKS["setup_nodejs"])],
+                [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+            ]
+        # Check if it's a funding issue and provide specific guidance
+        elif 'insufficient' in error_message.lower() or 'balance' in error_message.lower():
+            required = result.get('funding_required', 0.1)
+            current = result.get('current_balance', 0)
+            
+            keyboard = [
+                [InlineKeyboardButton("Check Balance", callback_data=CALLBACKS["refresh_balance"])],
+                [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+            ]
+            
+            funding_message = (
+                f"LOCK Token Creation Failed\n\n"
+                f"Reason: {error_message}\n\n"
+                f"To create LOCK tokens on LaunchLab, you need:\n"
+                f"• Minimum 0.1 SOL for token creation\n"
+                f"• Additional SOL if you want initial liquidity\n"
+                f"• Small amount for transaction fees\n\n"
+                f"Please add SOL to your wallet:\n"
+                f"`{wallet['public']}`"
+            )
+            error_message = funding_message
+        else:
+            keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        
+        await query.message.edit_text(error_message,
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode="Markdown")
+        return
+
+    # SUCCESS: Enhanced success handling with LOCK verification
+    tx_signature = result.get('signature')
+    vanity_address = result.get('mint')
+    attempts = result.get('attempts', 0)
+    is_pure_creation = result.get('pure_creation', False)
+    funding_used = result.get('funding_used', 0)
+    balance_after = result.get('wallet_balance_after', 0)
+    verified_lock_suffix = result.get('verified_lock_suffix', False)
+    funding_target = result.get('funding_target', 85)
+    
+    # CRITICAL: Final verification that address ends with 'lock'
+    if not vanity_address.lower().endswith('lock'):
+        logger.error(f"CRITICAL ERROR: Final address doesn't end with LOCK: {vanity_address}")
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await query.message.edit_text(
+            f"CRITICAL ERROR: Token created but address verification failed!\n\n"
+            f"Expected: Address ending with 'lock'\n"
+            f"Got: {vanity_address}\n\n"
+            f"Please contact support.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Build success message with LOCK verification
+    tx_link = f"https://solscan.io/tx/{tx_signature}"
+    chart_url = f"https://raydium.io/launchpad/token/?mint={vanity_address}"
+
+    if is_pure_creation:
+        mode_description = (
+            f"*Launch Mode:* Pure Creation\n"
+            f"• Token created without initial liquidity\n"
+            f"• Ready for bonding curve trading\n"
+            f"• Cost: {funding_used:.6f} SOL"
+        )
+    else:
+        initial_buy = result.get('initial_liquidity_sol', 0)
+        mode_description = (
+            f"*Launch Mode:* With Bonding Curve Liquidity\n"
+            f"• Initial Liquidity: {initial_buy} SOL\n"
+            f"• Total Cost: {funding_used:.6f} SOL\n"
+            f"• Immediate trading available"
+        )
+
+    message = (
+        f"LOCK Token Launched Successfully!\n\n"
+        f"*{coin_data.get('name')}* ({coin_data.get('ticker')})\n"
+        f"*Contract:* `{vanity_address}`\n"
+        f"*LOCK Verified:* Ends with '{vanity_address[-4:]}'\n\n"
+        f"*Token Details:*\n"
+        f"• Supply: {coin_data.get('total_supply', 1_000_000_000):,}\n"
+        f"• Generated in: {attempts:,} attempts\n"
+        f"• Wallet Balance: {balance_after:.6f} SOL remaining\n"
+        f"• LOCK Suffix Verified: {'✅' if verified_lock_suffix else '❌'}\n\n"
+        + mode_description + "\n\n"
+        f"*LOCK Features:*\n"
+        f"• Contract ends with '{CONTRACT_SUFFIX}' ✅\n"
+        f"• Raydium LaunchLab bonding curve\n"
+        f"• Auto-graduation at {funding_target} SOL\n\n"
+        f"Your LOCK token is now live!\n\n"
+        f"Contract: `{vanity_address}`"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("View on Raydium", url=chart_url)],
+        [InlineKeyboardButton("View on Solscan", url=f"https://solscan.io/account/{vanity_address}")],
+        [InlineKeyboardButton("View Transaction", url=tx_link)],
+        [InlineKeyboardButton("Launch Another LOCK", callback_data=CALLBACKS["launch"])],
+        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+    ]
+
+    # Save to user coins with LOCK verification
+    if user_id not in user_coins:
+        user_coins[user_id] = []
+    user_coins[user_id].append({
+        "name": coin_data.get("name", "Unnamed LOCK Token"),
+        "ticker": coin_data.get("ticker", ""),
+        "tx_link": tx_link,
+        "chart_url": chart_url,
+        "mint": vanity_address,
+        "is_vanity": True,
+        "vanity_suffix": CONTRACT_SUFFIX,
+        "generation_attempts": attempts,
+        "has_liquidity": not is_pure_creation,
+        "initial_buy_amount": result.get('initial_liquidity_sol', 0),
+        "platform": "Raydium LaunchLab",
+        "funding_used": funding_used,
+        "verified_lock_suffix": verified_lock_suffix,
+        "funding_target": funding_target,
+        "created_at": datetime.now().isoformat()
+    })
+    
+    # Clear launch data
+    context.user_data.pop("launch_step_index", None)
+    context.user_data.pop("coin_data", None)
+    
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ----- LAUNCHED TOKENS DISPLAY FOR LOCK TOKENS -----
+async def show_launched_coins(update: Update, context):
+    """Show user's launched LOCK tokens"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_coins_list = user_coins.get(user_id, [])
+    
+    if not user_coins_list:
+        message = f"You haven't launched any LOCK tokens yet.\n\nStart creating your LOCK collection today!\n\nAll your tokens will have contract addresses ending with '{CONTRACT_SUFFIX}'"
+        keyboard = [
+            [InlineKeyboardButton("Launch First LOCK Token", callback_data=CALLBACKS["launch"])],
+            [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        ]
+    else:
+        message = f"Your LOCK Token Portfolio ({len(user_coins_list)} tokens):\n\n"
+        
+        for i, coin in enumerate(user_coins_list[-10:], 1):  # Show last 10 tokens
+            created_date = coin.get("created_at", "")
+            attempts = coin.get("generation_attempts", 0)
+            has_liquidity = coin.get("has_liquidity", False)
+            platform = coin.get("platform", "Raydium LaunchLab")
+            verified = coin.get("verified_on_chain", False)
+            funding_used = coin.get("funding_used", 0)
+            verified_lock_suffix = coin.get("verified_lock_suffix", False)
+            
+            if created_date:
+                try:
+                    date_obj = datetime.fromisoformat(created_date.replace('Z', '+00:00'))
+                    date_str = date_obj.strftime("%m/%d %H:%M")
+                except:
+                    date_str = "Unknown"
+            else:
+                date_str = "Unknown"
+            
+            # Show last 8 chars to highlight the lock suffix
+            contract_display = f"...{coin['mint'][-8:]}" if len(coin['mint']) > 8 else coin['mint']
+                
+            message += f"{i}. *{coin['ticker']}* - {coin['name']}\n"
+            message += f"   Contract: `{contract_display}`\n"
+            message += f"   Created: {date_str}\n"
+            message += f"   Platform: {platform}\n"
+            if attempts > 0:
+                message += f"   Generated in {attempts:,} attempts\n"
+            message += f"   Mode: {'With Liquidity' if has_liquidity else 'Pure Creation'}\n"
+            if funding_used > 0:
+                message += f"   Cost: {funding_used:.4f} SOL\n"
+            message += f"   Status: {'✅ Verified' if verified else '○ Pending'}\n"
+            message += f"   LOCK: {'✅' if verified_lock_suffix else '○'}\n"
+            message += f"\n"
+        
+        if len(user_coins_list) > 10:
+            message += f"... and {len(user_coins_list) - 10} more LOCK tokens\n\n"
+        
+        message += f"All tokens have vanity addresses ending with '{CONTRACT_SUFFIX}'!"
+        
+        keyboard = [
+            [InlineKeyboardButton("Launch Another LOCK", callback_data=CALLBACKS["launch"])],
+            [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+        ]
+    
+    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ----- NODEJS SETUP INSTRUCTIONS -----
+async def show_nodejs_setup_instructions(update: Update, context):
+    """Show Node.js setup instructions"""
+    query = update.callback_query
+    await query.answer()
+    
+    setup_instructions = (
+        f"Node.js Setup Instructions\n\n"
+        f"To create LOCK tokens ending with '{CONTRACT_SUFFIX}', you need:\n\n"
+        f"*1. Install Node.js 18+*\n"
+        f"Download from: nodejs.org\n\n"
+        f"*2. Create package.json*\n"
+        f"Required dependencies:\n"
+        f"• @raydium-io/raydium-sdk-v2\n"
+        f"• @solana/web3.js\n"
+        f"• @solana/spl-token\n"
+        f"• bn.js\n"
+        f"• decimal.js\n\n"
+        f"*3. Install Dependencies*\n"
+        f"Run: `npm install`\n\n"
+        f"*4. Create Token Script*\n"
+        f"Need one of:\n"
+        f"• create_raydium_token.js\n"
+        f"• create_launchlab_token.js\n\n"
+        f"*Current Status:*\n"
+        f"{NODEJS_SETUP_MESSAGE}\n\n"
+        f"Once setup is complete, restart the bot to enable LOCK token creation."
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("Check Status Again", callback_data=CALLBACKS["settings"])],
+        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+    ]
+    
+    await query.message.edit_text(setup_instructions, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ----- MAIN MENU & WELCOME MESSAGE FOR LOCK TOKENS -----
 def generate_inline_keyboard():
     return [
-        [InlineKeyboardButton("Launch", callback_data=CALLBACKS["launch"])],
+        [InlineKeyboardButton("Launch LOCK Token", callback_data=CALLBACKS["launch"])],
         [
             InlineKeyboardButton("Subscription", callback_data=CALLBACKS["subscription"]),
             InlineKeyboardButton("Wallets", callback_data=CALLBACKS["wallets"]),
             InlineKeyboardButton("Settings", callback_data=CALLBACKS["settings"]),
         ],
         [
-            InlineKeyboardButton("Volume Bots", callback_data=CALLBACKS["bump_volume"]),
+            InlineKeyboardButton("My LOCK Tokens", callback_data=CALLBACKS["launched_coins"]),
             InlineKeyboardButton("Socials", callback_data=CALLBACKS["socials"]),
         ],
         [InlineKeyboardButton("Refresh", callback_data=CALLBACKS["refresh_balance"])]
@@ -887,20 +2029,26 @@ async def start(update: Update, context):
         balance = get_wallet_balance(wallet_address)
         user_wallets[user_id]["balance"] = balance
         
+        # Show wallet funding status for LaunchLab requirements
+        funding_status = "Ready" if balance >= 0.1 else "Needs Funding"
+        nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+        
         welcome_message = (
-            "Welcome to PumpBot!\n\n"
-            "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
-            f"You currently have {balance:.6f} SOL balance.\n"
-            "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+            f"Welcome to the LOCK Token Launcher!\n\n"
+            f"Create professional tokens with vanity contract addresses ending in '{CONTRACT_SUFFIX}' using Raydium LaunchLab.\n\n"
+            f"Current Balance: {balance:.6f} SOL\n"
+            f"Status: {funding_status}\n"
+            f"Node.js: {nodejs_status}\n\n"
+            "Send SOL to your wallet to get started:\n"
             f"`{wallet_address}`\n\n"
-            "Once done, tap Refresh and your balance will appear here.\n\n"
-            "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
+            f"Minimum required: 0.1 SOL for LaunchLab creation\n"
+            "Your funds are safe, but never share your private key."
         )
         reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
         await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error in start command: {e}", exc_info=True)
-        await update.message.reply_text("An error occurred while starting PUMPbot. Please try again.")
+        await update.message.reply_text("An error occurred. Please try again.")
 
 async def go_to_main_menu(query, context):
     context.user_data["nav_stack"] = []
@@ -910,17 +2058,24 @@ async def go_to_main_menu(query, context):
         wallet_address = wallet["public"]
         balance = get_wallet_balance(wallet_address)
         wallet["balance"] = balance
+        funding_status = "Ready" if balance >= 0.1 else "Needs Funding"
     else:
         wallet_address = "No wallet"
         balance = 0.0
+        funding_status = "No wallet"
+    
+    nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+        
     welcome_message = (
-        "Welcome to PumpBot!\n\n"
-        "The fastest way to launch and manage assets, created by a team of friends from the PUMP community.\n\n"
-        f"You currently have {balance:.6f} SOL balance.\n"
-        "To get started, subscribe first and send some SOL to your PumpBot wallet address:\n\n"
+        f"Welcome to the LOCK Token Launcher!\n\n"
+        f"Create professional tokens with vanity contract addresses ending in '{CONTRACT_SUFFIX}' using Raydium LaunchLab.\n\n"
+        f"Current Balance: {balance:.6f} SOL\n"
+        f"Status: {funding_status}\n"
+        f"Node.js: {nodejs_status}\n\n"
+        "Send SOL to your wallet to get started:\n"
         f"`{wallet_address}`\n\n"
-        "Once done, tap Refresh and your balance will appear here.\n\n"
-        "Remember: We guarantee the safety of user funds on PumpBot, but if you expose your private key your funds will not be safe."
+        f"Minimum required: 0.1 SOL for LaunchLab creation\n"
+        "Your funds are safe, but never share your private key."
     )
     reply_markup = InlineKeyboardMarkup(generate_inline_keyboard())
     try:
@@ -931,214 +2086,11 @@ async def go_to_main_menu(query, context):
         else:
             raise e
 
-# ----- PLATFORM SELECTION FOR LAUNCH -----
-async def show_platform_selection(update: Update, context):
-    """Show platform selection for token launch"""
-    query = update.callback_query
-    await query.answer()
-    
-    message = (
-        "Choose Launch Platform:\n\n"
-        "*Pump.fun* - Original meme coin launchpad\n"
-        "• SOL-based trading\n"
-        "• High liquidity and volume\n"
-        "• Most popular platform\n\n"
-        "*Bonk.fun (LetsBonk)* - Community-driven platform\n"
-        "• Built on Raydium Launchlab\n"
-        "• WSOL trading pairs\n"
-        "• Bonding curve mechanics\n\n"
-        "*Moonshot* - Advanced features\n"
-        "• USDC-denominated\n"
-        "• Professional trading tools\n"
-        "• Institutional-grade infrastructure"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("Pump.fun", callback_data=CALLBACKS["launch_platform_pump"])],
-        [InlineKeyboardButton("Bonk.fun", callback_data=CALLBACKS["launch_platform_bonk"])],
-        [InlineKeyboardButton("Moonshot", callback_data=CALLBACKS["launch_platform_moonshot"])],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"]),
-         InlineKeyboardButton("Back", callback_data=CALLBACKS["dynamic_back"])]
-    ]
-    
-    push_nav_state(context, {
-        "message_text": query.message.text,
-        "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
-        "parse_mode": "Markdown"
-    })
-    
-    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-# ----- LAUNCH FLOW STEPS -----
-LAUNCH_STEPS = [
-    ("name", "Please enter the *Coin Name*:"), 
-    ("ticker", "Please enter the *Coin Ticker*:"), 
-    ("description", "Please enter the *Coin Description*:"), 
-    ("image", "Please send the *Logo Image* (image or video) for your coin:"), 
-    ("telegram", "Please enter your *Telegram Link*:"), 
-    ("website", "Please enter your *Website Link* (include https:// and .com):"), 
-    ("twitter", "Please enter your *Twitter/X Link* (include https:// and .com):"), 
-    ("buy_amount", "Choose how many SOL you want to spend buying your coin (optional).\nTip: Buying a small amount helps protect your coin from snipers.")
-]
-
-def start_launch_flow(context, platform):
-    context.user_data["launch_step_index"] = 0
-    context.user_data["coin_data"] = {"platform": platform}
-
-def get_launch_flow_keyboard(context, confirm=False, include_proceed=False):
-    keyboard = []
-    if include_proceed:
-        keyboard.append([InlineKeyboardButton("Proceed", callback_data=CALLBACKS["launch_proceed_buy_amount"])])
-    if confirm:
-        keyboard.append([
-            InlineKeyboardButton("Confirm", callback_data=CALLBACKS["launch_confirm_yes"]),
-            InlineKeyboardButton("Back", callback_data=CALLBACKS["launch_change_buy_amount"])
-        ])
-    row = [
-        InlineKeyboardButton("Launched Coins", callback_data=CALLBACKS["launched_coins"]),
-        InlineKeyboardButton("Cancel", callback_data=CALLBACKS["launch_confirm_no"])
-    ]
-    keyboard.append(row)
-    return InlineKeyboardMarkup(keyboard)
-
-async def prompt_current_launch_step(update_obj, context):
-    index = context.user_data.get("launch_step_index", 0)
-    platform = context.user_data.get("coin_data", {}).get("platform", "pump")
-    include_proceed = (index < len(LAUNCH_STEPS)) and (LAUNCH_STEPS[index][0] == "buy_amount")
-    
-    if not context.user_data.get("user_id") and hasattr(update_obj, "effective_user"):
-        context.user_data["user_id"] = update_obj.effective_user.id
-        
-    keyboard = get_launch_flow_keyboard(context, confirm=False, include_proceed=include_proceed)
-    
-    if "last_prompt_msg_id" in context.user_data:
-        try:
-            if hasattr(update_obj, "message") and update_obj.message:
-                await update_obj.message.bot.delete_message(update_obj.message.chat_id, context.user_data["last_prompt_msg_id"])
-            elif hasattr(update_obj, "callback_query") and update_obj.callback_query:
-                await update_obj.callback_query.message.bot.delete_message(update_obj.callback_query.message.chat_id, context.user_data["last_prompt_msg_id"])
-        except Exception:
-            pass
-            
-    if index < len(LAUNCH_STEPS):
-        step_key, prompt_text = LAUNCH_STEPS[index]
-        
-        # Customize buy_amount prompt based on platform
-        if step_key == "buy_amount":
-            if platform == "pump":
-                prompt_text = "Choose how many SOL you want to spend buying your coin (optional).\nTip: Buying a small amount helps protect your coin from snipers."
-            elif platform == "bonk":
-                prompt_text = "Choose your initial buy amount (optional).\nNote: Bonk.fun uses WSOL for trading.\nTip: Buying helps establish initial liquidity."
-            elif platform == "moonshot":
-                prompt_text = "Choose your initial buy amount in USDC (optional).\nNote: Moonshot uses USDC for all trades.\nTip: Initial buys help with price discovery."
-        
-        if hasattr(update_obj, "callback_query") and update_obj.callback_query:
-            sent_msg = await update_obj.callback_query.message.reply_text(prompt_text, reply_markup=keyboard, parse_mode="Markdown")
-        elif hasattr(update_obj, "message") and update_obj.message:
-            sent_msg = await update_obj.message.reply_text(prompt_text, reply_markup=keyboard, parse_mode="Markdown")
-        context.user_data["last_prompt_msg_id"] = sent_msg.message_id
-    else:
-        # Show review screen (shortened for brevity)
-        coin_data = context.user_data.get("coin_data", {})
-        platform_display = {"pump": "Pump.fun", "bonk": "Bonk.fun", "moonshot": "Moonshot"}.get(platform, platform)
-        
-        summary = (
-            "*Review your coin data:*\n\n" +
-            f"*Platform:* {platform_display}\n" +
-            f"*Name:* {coin_data.get('name')}\n" +
-            f"*Ticker:* {coin_data.get('ticker')}\n\n" +
-            "Are you sure you want to create this coin?"
-        )
-        
-        keyboard = get_launch_flow_keyboard(context, confirm=True, include_proceed=False)
-        
-        if hasattr(update_obj, "callback_query") and update_obj.callback_query:
-            sent_msg = await update_obj.callback_query.message.reply_text(summary, reply_markup=keyboard, parse_mode="Markdown")
-        elif hasattr(update_obj, "message") and update_obj.message:
-            sent_msg = await update_obj.message.reply_text(summary, reply_markup=keyboard, parse_mode="Markdown")
-        context.user_data["last_prompt_msg_id"] = sent_msg.message_id
-
-async def process_launch_confirmation(query, context):
-    coin_data = context.user_data.get("coin_data", {})
-    user_id = query.from_user.id
-    platform = coin_data.get("platform", "pump")
-
-    # Check wallet balance
-    wallet = user_wallets.get(user_id)
-    if not wallet:
-        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text("No wallet found. Please create a wallet first.",
-                                        reply_markup=InlineKeyboardMarkup(keyboard),
-                                        parse_mode="Markdown")
-        return
-        
-    buy_amount = coin_data.get("buy_amount", 1)
-    current_balance = get_wallet_balance(wallet["public"])
-    
-    if current_balance < buy_amount:
-        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text(f"You don't have enough SOL. Current: {current_balance:.6f} SOL, Required: {buy_amount} SOL",
-                                        reply_markup=InlineKeyboardMarkup(keyboard),
-                                        parse_mode="Markdown")
-        return
-
-    # Show processing message
-    await query.message.edit_text("Creating your token... Please wait.", parse_mode="Markdown")
-
-    # Create token
-    result = create_token_multi_platform(coin_data, wallet)
-    
-    if result.get('status') != 'success':
-        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await query.message.edit_text(f"Failed to launch coin: {result.get('message')}",
-                                        reply_markup=InlineKeyboardMarkup(keyboard),
-                                        parse_mode="Markdown")
-        return
-
-    tx_signature = result.get('signature')
-    mint = result.get('mint')
-    tx_link = f"https://solscan.io/tx/{tx_signature}"
-    chart_url = f"https://pump.fun/{mint}" if platform == "pump" else f"https://dexscreener.com/solana/{mint}"
-
-    # Save to user coins
-    if user_id not in user_coins:
-        user_coins[user_id] = []
-    user_coins[user_id].append({
-        "name": coin_data.get("name", "Unnamed Coin"),
-        "ticker": coin_data.get("ticker", ""),
-        "platform": platform,
-        "tx_link": tx_link,
-        "chart_url": chart_url,
-        "mint": mint,
-    })
-
-    message = (
-        f"Coin Launched!\n\n" +
-        f"*Name:* {coin_data.get('name')}\n" +
-        f"*Ticker:* {coin_data.get('ticker')}\n" +
-        f"*Contract:* `{mint}`\n\n" +
-        "Your coin is now live!"
-    )
-    
-    # Clear launch data
-    context.user_data.pop("launch_step_index", None)
-    context.user_data.pop("coin_data", None)
-    
-    keyboard = [
-        [InlineKeyboardButton("View Chart", url=chart_url)],
-        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
-    ]
-    await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-# ----- REFRESH HANDLER -----
+# ----- REFRESH HANDLER FOR LOCK TOKENS -----
 async def refresh_balance(update: Update, context):
     query = update.callback_query
     await query.answer()
     
-    if query.message.text.startswith("Welcome to PUMPbot!"):
-        await go_to_main_menu(query, context)
-        return
-        
     user_id = query.from_user.id
     wallet = user_wallets.get(user_id)
     
@@ -1156,9 +2108,23 @@ async def refresh_balance(update: Update, context):
     
     logger.info(f"Balance refreshed for {wallet_address}: {current_balance} SOL")
     
+    # Show funding requirements for LaunchLab
+    funding_status = "Ready for LOCK creation" if current_balance >= 0.1 else "Need more SOL"
+    funding_color = "✅" if current_balance >= 0.1 else "⚠"
+    nodejs_status = "✅ Ready" if NODEJS_AVAILABLE else "⚠ Setup Required"
+    
     message = (
-        f"Your Wallet:\n\nAddress:\n`{wallet_address}`\n\n"
-        f"Balance: {current_balance:.6f} SOL\n\n(Tap the address to copy)"
+        f"LOCK Wallet Balance:\n\nAddress:\n`{wallet_address}`\n\n"
+        f"Balance: {current_balance:.6f} SOL\n"
+        f"Status: {funding_color} {funding_status}\n"
+        f"Node.js: {nodejs_status}\n\n"
+        f"Ready to create LOCK tokens ending with '{CONTRACT_SUFFIX}'!\n\n"
+        f"LaunchLab Requirements:\n"
+        f"• Pure creation: 0.1+ SOL\n"
+        f"• With liquidity: 0.1+ SOL + buy amount\n"
+        f"• Recommended: 0.15+ SOL\n\n"
+        f"Node.js Status: {'Ready' if NODEJS_AVAILABLE else 'Setup Required'}\n\n"
+        "(Tap address to copy)"
     )
     
     keyboard = [
@@ -1194,6 +2160,14 @@ async def handle_wallets_menu(update: Update, context):
     balance = get_wallet_balance(wallet_address)
     bundle_total = sum(b.get("balance", 0) for b in wallet.get("bundle", []))
     total_holdings = balance + bundle_total
+    
+    # Count LOCK tokens and total funding used
+    tokens_count = len(user_coins.get(user_id, []))
+    total_funding_used = sum(coin.get("funding_used", 0) for coin in user_coins.get(user_id, []))
+    
+    funding_status = "✅ Ready" if balance >= 0.1 else "⚠ Needs SOL"
+    nodejs_status = "✅ Ready" if NODEJS_AVAILABLE else "⚠ Setup Required"
+    
     keyboard = [
         [InlineKeyboardButton("Wallet Details", callback_data=CALLBACKS["wallet_details"])],
         [InlineKeyboardButton("Show Private Key", callback_data=CALLBACKS["show_private_key"])],
@@ -1204,8 +2178,12 @@ async def handle_wallets_menu(update: Update, context):
     push_nav_state(context, {"message_text": query.message.text,
                              "keyboard": query.message.reply_markup.inline_keyboard if query.message.reply_markup else [],
                              "parse_mode": "Markdown"})
-    msg = (f"Wallet Management\n\nWallet Address:\n`{wallet_address}`\n\n"
-           f"Main Balance: {balance:.6f} SOL\nTotal Holdings: {total_holdings:.6f} SOL")
+    msg = (f"LOCK Wallet Management\n\nWallet Address:\n`{wallet_address}`\n\n"
+           f"Main Balance: {balance:.6f} SOL\nTotal Holdings: {total_holdings:.6f} SOL\n"
+           f"Status: {funding_status}\n"
+           f"Node.js: {nodejs_status}\n\n"
+           f"LOCK Tokens Created: {tokens_count}\n"
+           f"Total Spent on Tokens: {total_funding_used:.6f} SOL")
     await query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_wallet_details(update: Update, context):
@@ -1224,10 +2202,19 @@ async def show_wallet_details(update: Update, context):
     bundle_total = sum(b.get("balance", 0) for b in wallet.get("bundle", []))
     total_holdings = balance + bundle_total
     
+    funding_status = "✅ Ready for LOCK creation" if balance >= 0.1 else "⚠ Need more SOL"
+    nodejs_status = "✅ Ready" if NODEJS_AVAILABLE else "⚠ Setup Required"
+    
     message = (
-        f"Your Wallet:\n\nAddress:\n`{wallet['public']}`\n\n"
-        f"Main Balance: {balance:.6f} SOL\nTotal Holdings: {total_holdings:.6f} SOL\n\n"
-        "Tap the address to copy.\nDeposit SOL and tap Refresh to update your balance."
+        f"LOCK Wallet Details:\n\nAddress:\n`{wallet['public']}`\n\n"
+        f"Main Balance: {balance:.6f} SOL\nTotal Holdings: {total_holdings:.6f} SOL\n"
+        f"Status: {funding_status}\n"
+        f"Node.js: {nodejs_status}\n\n"
+        "Tap address to copy.\nDeposit SOL and tap Refresh to update balance.\n\n"
+        f"LaunchLab Creation Requirements:\n"
+        f"• Pure creation: 0.1+ SOL\n"
+        f"• With liquidity: 0.1+ SOL + buy amount\n\n"
+        f"Ready to create LOCK tokens ending with '{CONTRACT_SUFFIX}'!"
     )
     keyboard = [
         [InlineKeyboardButton("Deposit SOL", callback_data=CALLBACKS["deposit_sol"]),
@@ -1243,11 +2230,9 @@ async def show_wallet_details(update: Update, context):
                              "parse_mode": "Markdown"})
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# ----- ULTIMATE FIXED WITHDRAWAL HANDLERS -----
+# ----- WITHDRAWAL HANDLERS (same as before but with better error messages) -----
 async def handle_percentage_withdrawal(update: Update, context, percentage: str):
-    """
-    ULTIMATE FIXED: Handle withdrawal with proper account status checking
-    """
+    """Handle withdrawal with proper account status checking"""
     query = update.callback_query
     await query.answer()
     
@@ -1313,7 +2298,7 @@ async def handle_percentage_withdrawal(update: Update, context, percentage: str)
             parse_mode="Markdown"
         )
         
-        # Execute withdrawal using the ultimate fixed function
+        # Execute withdrawal
         result = transfer_sol_ultimate(wallet, destination, withdrawal_amount)
         
         # Clean up context data
@@ -1330,7 +2315,7 @@ async def handle_percentage_withdrawal(update: Update, context, percentage: str)
             new_balance = get_wallet_balance(wallet["public"])
             
             message = (
-                f"SUCCESS! Withdrawal Complete\n\n"
+                f"Withdrawal Complete!\n\n"
                 f"Amount: {withdrawal_amount:.6f} SOL ({percentage}%)\n"
                 f"To: `{destination}`\n"
                 f"New Balance: {new_balance:.6f} SOL\n\n"
@@ -1350,11 +2335,11 @@ async def handle_percentage_withdrawal(update: Update, context, percentage: str)
             
             # Provide specific solutions
             if "AccountNotFound" in error_msg or "no record of a prior credit" in error_msg:
-                solution = "\n\nFIX: Your account needs activation\n1. Deposit 0.005+ SOL total\n2. Wait 2-3 minutes\n3. Try again"
+                solution = "\n\nSOLUTION: Your account needs more SOL\n1. Deposit 0.05+ SOL total\n2. Wait 2-3 minutes\n3. Try again"
             elif "rent exemption" in error_msg:
-                solution = "\n\nFIX: Leave minimum SOL in wallet\n1. Try smaller withdrawal amount\n2. Keep 0.001 SOL minimum"
+                solution = "\n\nSOLUTION: Leave minimum SOL in wallet\n1. Try smaller withdrawal amount\n2. Keep 0.001 SOL minimum"
             else:
-                solution = "\n\nTry again in a few minutes"
+                solution = "\n\nTry again in a few minutes or contact support"
             
             message = (
                 f"Withdrawal Failed\n\n"
@@ -1378,15 +2363,13 @@ async def handle_percentage_withdrawal(update: Update, context, percentage: str)
         
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
         await query.message.edit_text(
-            f"Critical error. Your funds are safe.\nPlease try again.",
+            f"Critical error. Your funds are safe.\nPlease try again later.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
 async def handle_withdraw_address_input(update: Update, context):
-    """
-    Enhanced withdrawal address handler with validation
-    """
+    """Enhanced withdrawal address handler with validation"""
     user_input = update.message.text.strip()
     destination = user_input
     
@@ -1469,7 +2452,7 @@ async def handle_withdraw_address_input(update: Update, context):
     await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     return True
 
-# ----- SUBSCRIPTION FEATURES (Simplified) -----
+# ----- SUBSCRIPTION FEATURES -----
 def process_subscription_payment(user_id, plan):
     subscription_cost = SUBSCRIPTION_PRICING.get(plan, 0)
     wallet = user_wallets.get(user_id)
@@ -1490,11 +2473,12 @@ def process_subscription_payment(user_id, plan):
         expires_at = now + timedelta(days=30)
     else:
         expires_at = None
+    
     user_subscriptions[user_id] = {
         "active": True,
         "plan": plan,
         "amount": subscription_cost,
-        "expires_at": expires_at,
+        "expires_at": expires_at.isoformat() if expires_at else None,
         "tx_signature": fake_signature
     }
     return {"status": "success", "message": "Subscription activated"}
@@ -1502,13 +2486,37 @@ def process_subscription_payment(user_id, plan):
 async def show_subscription_details(update: Update, context):
     query = update.callback_query
     await query.answer()
-    subscription = user_subscriptions.get(query.from_user.id, {})
     
-    if subscription.get("active"):
-        message = f"*Subscription Active!*\nPlan: {subscription.get('plan').capitalize()}"
+    user_id = query.from_user.id
+    sub_status = get_subscription_status(user_id)
+    
+    if sub_status["active"]:
+        time_left_str = ""
+        if sub_status["time_left"]:
+            days = sub_status["time_left"].days
+            hours, remainder = divmod(sub_status["time_left"].seconds, 3600)
+            if days > 0:
+                time_left_str = f"\nTime left: {days} days, {hours} hours"
+            else:
+                time_left_str = f"\nTime left: {hours} hours"
+        
+        nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+        
+        message = (
+            f"*Subscription Active!*\n"
+            f"Plan: {sub_status['plan'].capitalize()}{time_left_str}\n\n"
+            f"Node.js Status: {nodejs_status}\n\n"
+            f"You can now create LOCK tokens ending with '{CONTRACT_SUFFIX}' on Raydium LaunchLab!"
+        )
         keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
     else:
-        message = "Choose subscription plan:"
+        nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+        
+        message = (
+            f"Subscribe to create LOCK tokens:\n\n"
+            f"Unlock the ability to create tokens with contract addresses ending in '{CONTRACT_SUFFIX}' on Raydium LaunchLab.\n\n"
+            f"Node.js Status: {nodejs_status}"
+        )
         keyboard = [
             [InlineKeyboardButton("Weekly - FREE", callback_data="subscription:weekly")],
             [InlineKeyboardButton("Monthly - 3 SOL", callback_data="subscription:monthly")],
@@ -1525,14 +2533,19 @@ async def process_subscription_plan(update: Update, context):
     result = process_subscription_payment(user_id, plan)
     
     if result["status"] == "success":
-        message = f"{plan.capitalize()} subscription activated!"
+        nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+        message = (
+            f"{plan.capitalize()} subscription activated!\n\n"
+            f"Node.js Status: {nodejs_status}\n\n"
+            f"You can now create LOCK tokens ending with '{CONTRACT_SUFFIX}' on Raydium LaunchLab!"
+        )
     else:
         message = f"Subscription failed: {result['message']}"
     
     keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# ----- SIMPLIFIED BUNDLE MANAGEMENT -----
+# ----- BUNDLE MANAGEMENT -----
 async def show_bundle(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -1551,14 +2564,241 @@ async def show_bundle(update: Update, context):
             bundle_list.append({"public": public_key, "private": private_key, "mnemonic": mnemonic, "balance": 0})
         wallet["bundle"] = bundle_list
     
-    message = "Bundle Wallets Created\n\n"
+    message = f"Bundle Wallets for LOCK Token Management\n\n"
     for idx, b_wallet in enumerate(wallet["bundle"], start=1):
         message += f"{idx}. `{b_wallet['public']}`\n"
     
     keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
     await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# ----- MAIN CALLBACK HANDLER -----
+# ----- MESSAGE HANDLERS -----
+async def import_private_key(update: Update, context):
+    user_id = update.message.from_user.id
+    user_private_key = update.message.text.strip()
+    try:
+        await update.message.delete()
+        private_key_bytes = base58.b58decode(user_private_key)
+        if len(private_key_bytes) != 64:
+            raise ValueError("Invalid private key length")
+        keypair = SoldersKeypair.from_bytes(private_key_bytes)
+        public_key = str(keypair.pubkey())
+        user_wallets[user_id] = {"public": public_key, "private": user_private_key, "mnemonic": None, "balance": 0}
+        balance = get_wallet_balance(public_key)
+        user_wallets[user_id]["balance"] = balance
+        
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await update.message.reply_text(
+            f"Wallet imported:\n`{public_key}`\nBalance: {balance:.6f} SOL", 
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+        await update.message.reply_text(
+            f"Import failed: {str(e)}", 
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+async def handle_text_message(update: Update, context):
+    user_input = update.message.text.strip()
+    
+    # Handle withdraw address input
+    if "awaiting_withdraw_dest" in context.user_data:
+        success = await handle_withdraw_address_input(update, context)
+        if success:
+            return
+        context.user_data.pop("awaiting_withdraw_dest", None)
+        return
+    
+    # Handle wallet import
+    if context.user_data.get("awaiting_import"):
+        await import_private_key(update, context)
+        context.user_data.pop("awaiting_import", None)
+        return
+    
+    # Handle coin launch flow
+    if "launch_step_index" in context.user_data:
+        index = context.user_data.get("launch_step_index", 0)
+        
+        if index >= len(LAUNCH_STEPS):
+            return
+            
+        step_key, _ = LAUNCH_STEPS[index]
+        
+        if step_key in ["image", "banner"]:
+            await update.message.reply_text("Please send an image file, not text.")
+            return
+        
+        # Handle total supply selection
+        if step_key == "total_supply":
+            if user_input in TOKEN_SUPPLY_PRESETS:
+                if user_input == "7":  # Custom
+                    await update.message.reply_text("Enter your custom token supply (e.g., 500000000):")
+                    context.user_data["awaiting_custom_supply"] = True
+                    return
+                else:
+                    supply = TOKEN_SUPPLY_PRESETS[user_input]
+                    context.user_data.setdefault("coin_data", {})[step_key] = supply
+            else:
+                # Try to parse as number
+                try:
+                    supply = int(float(user_input))
+                    if supply < 1000000:  # Minimum 1M tokens
+                        await update.message.reply_text("Minimum token supply is 1,000,000. Please enter a larger amount.")
+                        return
+                    elif supply > 1000000000000:  # Maximum 1T tokens
+                        await update.message.reply_text("Maximum token supply is 1,000,000,000,000 (1T). Please enter a smaller amount.")
+                        return
+                    context.user_data.setdefault("coin_data", {})[step_key] = supply
+                except ValueError:
+                    await update.message.reply_text("Invalid input. Please enter a number (1-7) or custom supply amount.")
+                    return
+        
+        # Handle custom supply input
+        elif context.user_data.get("awaiting_custom_supply"):
+            try:
+                supply = int(float(user_input))
+                if supply < 1000000:
+                    await update.message.reply_text("Minimum token supply is 1,000,000. Please enter a larger amount.")
+                    return
+                elif supply > 1000000000000:
+                    await update.message.reply_text("Maximum token supply is 1,000,000,000,000 (1T). Please enter a smaller amount.")
+                    return
+                context.user_data.setdefault("coin_data", {})["total_supply"] = supply
+                context.user_data.pop("awaiting_custom_supply", None)
+            except ValueError:
+                await update.message.reply_text("Please enter a valid number for token supply.")
+                return
+        
+        # Handle decimals
+        elif step_key == "decimals":
+            try:
+                decimals = int(user_input)
+                if decimals < 0 or decimals > 9:
+                    await update.message.reply_text("Decimals must be between 0-9. Recommended: 6 or 9.")
+                    return
+                context.user_data.setdefault("coin_data", {})[step_key] = decimals
+            except ValueError:
+                await update.message.reply_text("Please enter a valid number for decimals (0-9).")
+                return
+        
+        # Handle optional buy amount (NEW: supports skip)
+        elif step_key == "buy_amount":
+            if user_input.lower() in ["skip", "none", ""]:
+                # Skip initial buy - pure token creation
+                context.user_data.setdefault("coin_data", {})[step_key] = None
+            else:
+                try:
+                    buy_amount = float(user_input)
+                    if buy_amount < 0:
+                        await update.message.reply_text("Buy amount cannot be negative. Use 'skip' for no initial purchase.")
+                        return
+                    elif buy_amount > 50:
+                        await update.message.reply_text("Maximum initial purchase is 50 SOL for safety.")
+                        return
+                    
+                    # Check if user has enough balance
+                    user_id = update.message.from_user.id
+                    wallet = user_wallets.get(user_id)
+                    if wallet:
+                        current_balance = get_wallet_balance(wallet["public"])
+                        required_total = 0.1 + buy_amount  # LaunchLab requirement
+                        if current_balance < required_total:
+                            await update.message.reply_text(
+                                f"Insufficient balance.\n"
+                                f"Required: {required_total:.6f} SOL (0.1 creation + {buy_amount} buy)\n"
+                                f"Current: {current_balance:.6f} SOL\n"
+                                f"Please add more SOL or reduce buy amount."
+                            )
+                            return
+                    
+                    context.user_data.setdefault("coin_data", {})[step_key] = buy_amount
+                except ValueError:
+                    await update.message.reply_text("Please enter a valid number for SOL amount or 'skip' for no initial purchase.")
+                    return
+        
+        # Handle banner skip
+        elif step_key == "banner" and user_input.lower() == "skip":
+            context.user_data.setdefault("coin_data", {})[step_key] = None
+        
+        # Handle optional fields
+        elif step_key in ["website", "twitter", "telegram"] and user_input.lower() in ["skip", "none", ""]:
+            context.user_data.setdefault("coin_data", {})[step_key] = None
+        
+        # Handle regular text inputs
+        else:
+            # Validate description length
+            if step_key == "description" and len(user_input) > 500:
+                await update.message.reply_text("Description too long. Please keep it under 500 characters.")
+                return
+            
+            context.user_data.setdefault("coin_data", {})[step_key] = user_input
+        
+        context.user_data["launch_step_index"] = index + 1
+        await prompt_current_launch_step(update, context)
+        return
+    
+    # Default response
+    await update.message.reply_text(f"Use the buttons to create LOCK tokens ending with '{CONTRACT_SUFFIX}'.")
+
+async def handle_media_message(update: Update, context):
+    if "launch_step_index" in context.user_data:
+        index = context.user_data.get("launch_step_index", 0)
+        step_key, _ = LAUNCH_STEPS[index]
+        
+        if step_key in ["image", "banner"]:
+            file = None
+            file_size_mb = 0
+            
+            if update.message.photo:
+                file_id = update.message.photo[-1].file_id
+                file = await context.bot.get_file(file_id)
+                file_size_mb = file.file_size / (1024 * 1024)  # Convert to MB
+                filename = f"{step_key}.png"
+                
+                # Check file size limits
+                max_size = 15 if step_key == "image" else 5
+                if file_size_mb > max_size:
+                    await update.message.reply_text(f"File too large. Maximum size for {step_key}: {max_size}MB")
+                    return
+                    
+            elif update.message.video and step_key == "image":  # Only allow video for logo
+                file_id = update.message.video.file_id
+                file = await context.bot.get_file(file_id)
+                file_size_mb = file.file_size / (1024 * 1024)
+                filename = f"{step_key}.mp4"
+                
+                if file_size_mb > 30:  # 30MB limit for videos
+                    await update.message.reply_text("Video too large. Maximum size: 30MB")
+                    return
+            
+            if file:
+                os.makedirs("./downloads", exist_ok=True)
+                file_path = f"./downloads/{filename}"
+                await file.download_to_drive(file_path)
+                
+                context.user_data.setdefault("coin_data", {})[step_key] = file_path
+                context.user_data["coin_data"][f"{step_key}_filename"] = filename
+                context.user_data["launch_step_index"] = index + 1
+                
+                keyboard = get_launch_flow_keyboard(context, confirm=False)
+                await update.message.reply_text(
+                    f"LOCK {step_key.title()} uploaded successfully!\n\nProceeding...",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                await asyncio.sleep(1)
+                
+                await prompt_current_launch_step(update, context)
+                return
+            else:
+                await update.message.reply_text(f"Please send a valid image for LOCK {step_key}.")
+                return
+                
+    await handle_text_message(update, context)
+
+# ----- MAIN CALLBACK HANDLER FOR LOCK TOKENS -----
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -1588,7 +2828,7 @@ async def button_callback(update: Update, context):
             if current_balance <= transaction_fee:
                 keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
                 await query.message.edit_text(
-                    f"Insufficient balance.\nCurrent: {current_balance:.6f} SOL\nMinimum: {transaction_fee:.6f} SOL",
+                    f"Insufficient balance for withdrawal.\nCurrent: {current_balance:.6f} SOL\nMinimum: {transaction_fee:.6f} SOL",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode="Markdown"
                 )
@@ -1640,7 +2880,7 @@ async def button_callback(update: Update, context):
             private_key = user_wallets[user_id]["private"]
             keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
             await query.message.edit_text(
-                f"Private Key:\n`{private_key}`\nKeep it safe!",
+                f"Private Key:\n`{private_key}`\n\nKeep it safe!",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
@@ -1654,36 +2894,114 @@ async def button_callback(update: Update, context):
             await go_to_main_menu(query, context)
         elif query.data == CALLBACKS["launch"]:
             user_id = query.from_user.id
-            subscription = user_subscriptions.get(user_id, {})
-            if not subscription.get("active"):
-                message = "You must subscribe to use Launch feature."
+            
+            # Check if subscription is active (with expiry check)
+            if not is_subscription_active(user_id):
+                nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+                message = (
+                    f"Subscribe to create LOCK tokens!\n\n"
+                    f"You need an active subscription to create LOCK tokens ending with '{CONTRACT_SUFFIX}' on Raydium LaunchLab.\n\n"
+                    f"Node.js Status: {nodejs_status}"
+                )
                 keyboard = [
-                    [InlineKeyboardButton("Subscribe", callback_data=CALLBACKS["subscription"])],
+                    [InlineKeyboardButton("Subscribe Now", callback_data=CALLBACKS["subscription"])],
                     [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
                 ]
                 await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             else:
-                await show_platform_selection(update, context)
-        elif query.data.startswith("launch_platform_"):
-            platform = query.data.split("_")[-1]
-            start_launch_flow(context, platform)
-            await prompt_current_launch_step(query, context)
+                # Check Node.js availability before wallet funding
+                if not NODEJS_AVAILABLE:
+                    keyboard = [
+                        [InlineKeyboardButton("Setup Instructions", callback_data=CALLBACKS["setup_nodejs"])],
+                        [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+                    ]
+                    await query.message.edit_text(
+                        f"Node.js Setup Required\n\n"
+                        f"To create LOCK tokens, you need:\n\n"
+                        f"{NODEJS_SETUP_MESSAGE}\n\n"
+                        f"Please complete the setup and restart the bot.",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown"
+                    )
+                    return
+                
+                # Check wallet funding after Node.js check
+                wallet = user_wallets.get(user_id)
+                if wallet:
+                    current_balance = get_wallet_balance(wallet["public"])
+                    if current_balance < 0.1:  # LaunchLab requirement
+                        keyboard = [
+                            [InlineKeyboardButton("Check Balance", callback_data=CALLBACKS["refresh_balance"])],
+                            [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+                        ]
+                        await query.message.edit_text(
+                            f"Insufficient SOL for LOCK Token Creation\n\n"
+                            f"Current Balance: {current_balance:.6f} SOL\n"
+                            f"Required: 0.1 SOL minimum (LaunchLab)\n\n"
+                            f"Please add SOL to your wallet:\n"
+                            f"`{wallet['public']}`",
+                            reply_markup=InlineKeyboardMarkup(keyboard),
+                            parse_mode="Markdown"
+                        )
+                        return
+                
+                # Start LOCK launch flow
+                start_launch_flow(context)
+                await prompt_current_launch_step(query, context)
         elif query.data == CALLBACKS["launch_confirm_yes"]:
             await process_launch_confirmation(query, context)
         elif query.data == CALLBACKS["launch_confirm_no"]:
             context.user_data.pop("launch_step_index", None)
             context.user_data.pop("coin_data", None)
             await go_to_main_menu(query, context)
+        elif query.data == CALLBACKS["launched_coins"]:
+            await show_launched_coins(update, context)
+        elif query.data == CALLBACKS["setup_nodejs"]:
+            await show_nodejs_setup_instructions(update, context)
         elif query.data == CALLBACKS["settings"]:
-            message = "Settings\n\nConfiguration coming soon."
-            keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
+            user_coins_count = len(user_coins.get(query.from_user.id, []))
+            estimates = estimate_vanity_generation_time(CONTRACT_SUFFIX)
+            nodejs_status = "Ready" if NODEJS_AVAILABLE else "Setup Required"
+            
+            message = (f"LOCK Token Launcher Settings\n\n"
+                       f"Contract Suffix: {CONTRACT_SUFFIX}\n"
+                       f"Platform: Raydium LaunchLab\n"
+                       f"Funding Target: 85 SOL\n"
+                       f"Generation Difficulty: {estimates['difficulty']}\n"
+                       f"Est. Time per Token: {estimates['time_estimate']}\n"
+                       f"Your LOCK Tokens Created: {user_coins_count}\n"
+                       f"Node.js Status: {nodejs_status}\n\n"
+                       f"LaunchLab Features:\n"
+                       f"• LOCK vanity addresses\n"
+                       f"• Raydium LaunchLab bonding curves\n"
+                       f"• Optional initial liquidity\n"
+                       f"• Auto-graduation at 85 SOL\n"
+                       f"• Pure creation mode available\n\n"
+                       f"Requirements:\n"
+                       f"• Minimum 0.1 SOL for creation\n"
+                       f"• Additional SOL for initial liquidity\n"
+                       f"• Valid subscription\n"
+                       f"• Node.js 18+ with required dependencies")
+            keyboard = [
+                [InlineKeyboardButton("Setup Instructions", callback_data=CALLBACKS["setup_nodejs"])],
+                [InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]
+            ]
             await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         elif query.data == CALLBACKS["socials"]:
-            message = "Connect with our community!"
+            message = (
+                f"LOCK Token Community\n\n"
+                f"Join the community of LOCK token creators!\n\n"
+                f"Share your vanity contracts ending with '{CONTRACT_SUFFIX}' and connect with other builders.\n\n"
+                "• Platform: Raydium LaunchLab\n"
+                "• All tokens LOCK compatible\n"
+                "• Bonding curve graduation at 85 SOL\n"
+                "• Professional token infrastructure\n\n"
+                "Community links coming soon..."
+            )
             keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
             await query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         else:
-            await query.message.edit_text("Feature coming soon!")
+            await query.message.edit_text("LOCK feature coming soon!")
             
     except Exception as e:
         logger.error(f"Error in button callback for {query.data}: {e}", exc_info=True)
@@ -1692,103 +3010,35 @@ async def button_callback(update: Update, context):
                                         reply_markup=InlineKeyboardMarkup(keyboard),
                                         parse_mode="Markdown")
 
-# ----- MESSAGE HANDLERS -----
-async def import_private_key(update: Update, context):
-    user_id = update.message.from_user.id
-    user_private_key = update.message.text.strip()
-    try:
-        await update.message.delete()
-        private_key_bytes = base58.b58decode(user_private_key)
-        if len(private_key_bytes) != 64:
-            raise ValueError("Invalid private key length")
-        keypair = SoldersKeypair.from_bytes(private_key_bytes)
-        public_key = str(keypair.pubkey())
-        user_wallets[user_id] = {"public": public_key, "private": user_private_key, "mnemonic": None, "balance": 0}
-        balance = get_wallet_balance(public_key)
-        user_wallets[user_id]["balance"] = balance
-        
-        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await update.message.reply_text(
-            f"Wallet imported:\n`{public_key}`\nBalance: {balance:.6f} SOL", 
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        keyboard = [[InlineKeyboardButton("Main Menu", callback_data=CALLBACKS["start"])]]
-        await update.message.reply_text(
-            f"Import failed: {str(e)}", 
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-async def handle_text_message(update: Update, context):
-    user_input = update.message.text.strip()
-    
-    # Handle withdraw address input - ULTIMATE FIXED
-    if "awaiting_withdraw_dest" in context.user_data:
-        success = await handle_withdraw_address_input(update, context)
-        if success:
-            return
-        context.user_data.pop("awaiting_withdraw_dest", None)
-        return
-    
-    # Handle wallet import
-    if context.user_data.get("awaiting_import"):
-        await import_private_key(update, context)
-        context.user_data.pop("awaiting_import", None)
-        return
-    
-    # Handle coin launch flow
-    if "launch_step_index" in context.user_data:
-        index = context.user_data.get("launch_step_index", 0)
-        
-        if index >= len(LAUNCH_STEPS):
-            return
-            
-        step_key, _ = LAUNCH_STEPS[index]
-        
-        if step_key == "image":
-            await update.message.reply_text("Please send an image file, not text.")
-            return
-            
-        context.user_data.setdefault("coin_data", {})[step_key] = user_input
-        context.user_data["launch_step_index"] = index + 1
-        await prompt_current_launch_step(update, context)
-        return
-    
-    # Default response
-    await update.message.reply_text("Please use the buttons or commands.")
-
-async def handle_media_message(update: Update, context):
-    if "launch_step_index" in context.user_data:
-        index = context.user_data.get("launch_step_index", 0)
-        step_key, _ = LAUNCH_STEPS[index]
-        if step_key == "image":
-            file = None
-            if update.message.photo:
-                file_id = update.message.photo[-1].file_id
-                file = await context.bot.get_file(file_id)
-                filename = "logo.png"
-            elif update.message.video:
-                file_id = update.message.video.file_id
-                file = await context.bot.get_file(file_id)
-                filename = "logo.mp4"
-            if file:
-                os.makedirs("./downloads", exist_ok=True)
-                file_path = f"./downloads/{filename}"
-                await file.download_to_drive(file_path)
-                context.user_data.setdefault("coin_data", {})["image"] = file_path
-                context.user_data["coin_data"]["image_filename"] = filename
-                context.user_data["launch_step_index"] = index + 1
-                await prompt_current_launch_step(update, context)
-                return
-    await handle_text_message(update, context)
-
 # ----- MAIN FUNCTION -----
 def main():
+    """
+    Enhanced main function with environment checks and wallet funding validation
+    Now allows bot to start even without Node.js setup
+    """
+    global NODEJS_AVAILABLE, NODEJS_SETUP_MESSAGE
+    
+    logger.info(f"LOCK Token Launcher Bot starting...")
+    logger.info(f"Target suffix: '{CONTRACT_SUFFIX}'")
+    
+    # Setup Node.js environment (now optional)
+    NODEJS_AVAILABLE = setup_nodejs_environment()
+    
+    if NODEJS_AVAILABLE:
+        logger.info("Node.js environment ready for token creation!")
+    else:
+        logger.warning("Node.js environment not ready. Bot will start with limited functionality.")
+        logger.warning(f"Setup message: {NODEJS_SETUP_MESSAGE}")
+    
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
+    
+    # Validate other environment variables
+    pinata_key = os.getenv("PINATA_API_KEY")
+    if not pinata_key or pinata_key == "demo":
+        logger.warning("PINATA_API_KEY not set - using fallback IPFS services")
+    
     application = Application.builder().token(bot_token).build()
     
     application.add_handler(CommandHandler("start", start))
@@ -1796,7 +3046,18 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
     
-    logger.info("ULTIMATE FIXED PumpBot started - withdrawal system fully operational!")
+    logger.info(f"LOCK Token Launcher Bot started successfully!")
+    logger.info(f"Features enabled:")
+    logger.info(f"• Vanity address generation (suffix: '{CONTRACT_SUFFIX}')")
+    if NODEJS_AVAILABLE:
+        logger.info(f"• Raydium LaunchLab integration")
+        logger.info(f"• Full token creation capabilities")
+    else:
+        logger.info(f"• Limited functionality (Node.js setup required for token creation)")
+    logger.info(f"• Wallet management and SOL transfers")
+    logger.info(f"• Enhanced error handling")
+    logger.info(f"• Subscription system")
+    
     application.run_polling()
 
 if __name__ == "__main__":

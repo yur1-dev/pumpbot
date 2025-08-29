@@ -1,0 +1,13 @@
+{
+  "mint_address": "2bTb6sC8pCffeLaBRVvNhw3XmVHeGPR4EyDwyae8afKZ",
+  "private_key": "fLX9TRK7v3DbeAVEP6zt3UPu7SkkaD3qDX4io1FmPAaVKALSLecoRKpworGcfFzE4ivSSVTTgmk1MzaAYWrHXZV",
+  "name": "testlock",
+  "symbol": "tlock",
+  "decimals": 9,
+  "totalSupply": 1000000000,
+  "uri": "data:application/json;base58,BdbV1MR86cXwcoTbbx8geZkc8oLzntZnq232dTuShgDuE3xkovvUfBnQ3yLByBEyKHDDGK3LPaXxYhYgayLg6GFTxHZ6RnytbDQWN8HoQZGsjAPu7bV9bft6StreBF1jAUsg5J7GvbMZk2se7HErqoGMfn8oVYk33n8PsWmHtjsDvA68APaV4m1CvicyNzZ4vqBkLWY2u7hWgu3rdtRhhAq8HPTSvoKdkAKxad74ryZSpeuG3sj85poEcJY1Ev1BuMrBDbhiP9kZY9R2jdjqCpvFfptDKssxNZbcFe65qBRTpWpGmozPDaw3e1zyUqjsKmDD42uVafQQfStZAvSURi1ehEuQoE3RTykL7FURG3ehMrDX8TJkeTGs6SrF2BRXtiGNTWVNmDntzw6SvCQVxvbuAmR6nsFYU68safs2k5BXJV45DEhkBPnc1EAumxwAjVfevHNcZxPrUf5hxGmPcetca1PohjytrSUxtPbD1k7V2tohtH9RXHdKmipDneu3y4Zdoz69vQ95ZntwWsiDMw6S4utebr819rG3i1Pf9yTqGErKrS9zmXHnVwxvz51u7ooioLfp3Qfu7MSFmpBRZgye8xHMeaiMGvFFA4xzMxbsMTfyoRRXjzDhQUGntt",
+  "initial_buy_amount": 0,
+  "created_at": "20250830_053233",
+  "platform": "Raydium LaunchLab",
+  "contract_suffix": "lock"
+}

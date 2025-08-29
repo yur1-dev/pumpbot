@@ -1,0 +1,38 @@
+{
+  "name": "lock-token-creator",
+  "version": "1.0.0",
+  "description": "LOCK Token Creator for Telegram Bot using Official Raydium LaunchLab SDK",
+  "main": "create_raydium_token_correct.js",
+  "scripts": {
+    "start": "node create_raydium_token_correct.js",
+    "test": "node create_raydium_token_correct.js token_params.json",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.87.6",
+    "@solana/spl-token": "^0.3.11",
+    "@raydium-io/raydium-sdk-v2": "^0.1.82",
+    "bn.js": "^5.2.1",
+    "decimal.js": "^10.4.3",
+    "bs58": "^5.0.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "token",
+    "lock",
+    "vanity",
+    "raydium",
+    "launchlab",
+    "bonding-curve",
+    "telegram"
+  ],
+  "author": "LOCK Token Creator",
+  "license": "MIT"
+}
