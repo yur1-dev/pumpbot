@@ -1,0 +1,11 @@
+{
+  "mintKeypair": "8WASVzkniQMAcizccfSwtVf7x+tas78Ws533ebakoX9bnZsnuecPtpBEoFuXf7Dj15YEDfj5KrA0l+JkIE0NwA==",
+  "creatorKeypair": "zWARi1YC1yxXbthSdLEyNfKD0/FpQ09ZK6JVTyBLOY/EE2wz1zs9BoE4gXDWqQMoypV1Vqkoh9WhGOzJC2kVaA==",
+  "name": "Test LOCK Token",
+  "symbol": "TLOCK",
+  "decimals": 9,
+  "totalSupply": 1000000000,
+  "uri": "https://example.com/metadata.json",
+  "hasInitialBuy": false,
+  "initialBuyAmount": 0
+}

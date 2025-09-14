@@ -2,26 +2,48 @@
   "name": "lock-token-creator",
   "version": "1.0.0",
   "description": "LOCK Token Creator for Telegram Bot using Official Raydium LaunchLab SDK",
-  "main": "create_raydium_token_correct.js",
+  "main": "create_launchlab_token.js",
   "scripts": {
-    "start": "node create_raydium_token_correct.js",
-    "test": "node create_raydium_token_correct.js token_params.json",
-    "install-deps": "npm install"
+    "start": "node create_launchlab_token.js",
+    "test": "node create_launchlab_token.js token_params.json",
+    "bot": "python bot.py",
+    "install-deps": "npm install --force",
+    "check-deps": "npm ls",
+    "clean": "rm -rf node_modules package-lock.json && npm install",
+    "setup": "npm run clean && npm run install-deps"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.87.6",
-    "@solana/spl-token": "^0.3.11",
-    "@raydium-io/raydium-sdk-v2": "^0.1.82",
-    "bn.js": "^5.2.1",
-    "decimal.js": "^10.4.3",
+    "@raydium-io/raydium-sdk-v2": "^0.2.26-alpha",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.7.2",
+    "base-64": "^1.0.0",
+    "base58": "^2.0.1",
+    "bn.js": "^5.2.2",
     "bs58": "^5.0.0",
-    "buffer": "^6.0.3"
+    "buffer": "^6.0.3",
+    "chalk": "^4.1.2",
+    "child_process": "^1.0.2",
+    "commander": "^12.1.0",
+    "cross-fetch": "^4.0.0",
+    "crypto": "^1.0.1",
+    "decimal.js": "^10.6.0",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0",
+    "fs": "^0.0.1-security",
+    "inquirer": "^8.2.6",
+    "path": "^0.12.7",
+    "util": "^0.12.5"
   },
   "devDependencies": {
-    "@types/bn.js": "^5.1.1"
+    "@types/axios": "^0.14.0",
+    "@types/bn.js": "^5.1.1",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
   },
   "keywords": [
     "solana",
@@ -31,8 +53,26 @@
     "raydium",
     "launchlab",
     "bonding-curve",
-    "telegram"
+    "telegram",
+    "optional-buy",
+    "spl-token"
   ],
   "author": "LOCK Token Creator",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/lock-token-creator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/lock-token-creator/issues"
+  },
+  "overrides": {
+    "@raydium-io/raydium-sdk-v2": {
+      "decimal.js": "^10.4.3"
+    }
+  },
+  "optionalDependencies": {
+    "bufferutil": "^4.0.8",
+    "utf-8-validate": "^6.0.4"
+  }
 }

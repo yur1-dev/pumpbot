@@ -1,0 +1,11 @@
+{
+  "mintKeypair": "X2ons6NqxJ0WP9VDIg0UU/wzOrdxxxtnA6vBqzoliSQyCoy1s4lksQGVWcgLOcWfzP7lE9FwsZtxwmJheawl4w==",
+  "creatorKeypair": "qjibjWYLjQm2oh8+RSZiYP+ZQrXyRrfBFfO+NR3OdpDAz2YGJlPJ76y0BawXqME86Nztl0Sw7l4DENI5dRZs0A==",
+  "name": "Test LOCK",
+  "symbol": "TEST",
+  "decimals": 9,
+  "totalSupply": 1000000000,
+  "uri": "https://example.com/metadata.json",
+  "hasInitialBuy": false,
+  "initialBuyAmount": 0
+}

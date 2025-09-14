@@ -1,0 +1,9 @@
+2025-08-31 00:16:53,202 - __main__ - INFO - Starting LOCK Token Creator Bot...
+2025-08-31 00:16:54,956 - __main__ - INFO - Bot is starting...
+2025-08-31 00:16:56,225 - apscheduler.scheduler - INFO - Scheduler started
+2025-08-31 00:16:56,226 - telegram.ext._application - INFO - Application started
+2025-08-31 00:17:01,152 - telegram.ext._updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2025-08-31 00:17:07,153 - telegram.ext._updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2025-08-31 00:17:12,586 - telegram.ext._application - INFO - Application is stopping. This might take a moment.
+2025-08-31 00:17:12,588 - apscheduler.scheduler - INFO - Scheduler has been shut down
+2025-08-31 00:17:12,588 - telegram.ext._application - INFO - Application.stop() complete

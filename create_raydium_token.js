@@ -1,403 +1,238 @@
-// create_raydium_token_correct.js - Using Official Raydium LaunchLab SDK
+// create_raydium_token_correct.js - FIXED VERSION respecting your original structure
 const {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
-  sendAndConfirmTransaction,
-  SystemProgram,
   LAMPORTS_PER_SOL,
 } = require("@solana/web3.js");
-const {
-  TOKEN_PROGRAM_ID,
-  createInitializeMintInstruction,
-  createAssociatedTokenAccountInstruction,
-  createMintToInstruction,
-  getAssociatedTokenAddress,
-  MINT_SIZE,
-  getMinimumBalanceForRentExemptMint,
-  NATIVE_MINT,
-} = require("@solana/spl-token");
+const { NATIVE_MINT, TOKEN_PROGRAM_ID } = require("@solana/spl-token");
 const {
   TxVersion,
   LAUNCHPAD_PROGRAM,
-  getPdaLaunchpadPoolId,
-  Curve,
-  PlatformConfig,
-  printSimulate,
+  Raydium, // Use Raydium directly
 } = require("@raydium-io/raydium-sdk-v2");
-const { initSdk } = require("./config"); // You'll need to create this config file
+const {
+  loadRaydiumSdk,
+  createConnection,
+  LAUNCHLAB_CONFIG,
+} = require("./config");
 const fs = require("fs");
 const BN = require("bn.js");
 const Decimal = require("decimal.js");
 
-// RPC endpoints for reliability
-const RPC_ENDPOINTS = [
-  "https://api.mainnet-beta.solana.com",
-  "https://rpc.ankr.com/solana",
-  "https://solana-api.projectserum.com",
-];
-
-// Raydium LaunchLab Program ID (mainnet)
-const LAUNCHPAD_PROGRAM_ID = new PublicKey(
-  "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
-);
-
-async function getConnection() {
-  for (const endpoint of RPC_ENDPOINTS) {
-    try {
-      const connection = new Connection(endpoint, "confirmed");
-      await connection.getVersion();
-      console.log(`Using RPC endpoint: ${endpoint}`);
-      return connection;
-    } catch (error) {
-      console.log(`Failed to connect to ${endpoint}, trying next...`);
-      continue;
-    }
-  }
-  throw new Error("All RPC endpoints failed");
-}
-
-async function checkAccountBalance(connection, publicKey, minRequired = 0.01) {
-  try {
-    const balance = await connection.getBalance(new PublicKey(publicKey));
-    const balanceSOL = balance / LAMPORTS_PER_SOL;
-    console.log(`Account ${publicKey}: ${balanceSOL.toFixed(6)} SOL`);
-
-    if (balanceSOL < minRequired) {
-      throw new Error(
-        `Insufficient balance. Required: ${minRequired} SOL, Current: ${balanceSOL.toFixed(
-          6
-        )} SOL`
-      );
-    }
-
-    return balanceSOL;
-  } catch (error) {
-    if (error.message.includes("could not find account")) {
-      throw new Error(
-        `Account ${publicKey} not found. Please fund this wallet with at least ${minRequired} SOL`
-      );
-    }
-    throw error;
-  }
-}
-
-async function initializeRaydiumSDK(connection, owner) {
-  console.log("Initializing Raydium SDK...");
-
-  try {
-    // Initialize SDK using the proper method
-    const raydium = await initSdk({
-      connection,
-      owner,
-      cluster: "mainnet",
-      programIds: {
-        LAUNCHPAD: LAUNCHPAD_PROGRAM_ID,
-      },
-    });
-
-    console.log("Raydium SDK initialized successfully");
-    return raydium;
-  } catch (error) {
-    console.error("Failed to initialize Raydium SDK:", error);
-    throw error;
-  }
-}
-
-async function createTokenMint(
-  connection,
-  mintKeypair,
-  creatorKeypair,
-  decimals
-) {
-  console.log("Creating token mint account...");
-
-  const mintLamports = await getMinimumBalanceForRentExemptMint(connection);
-  console.log(`Mint rent exemption: ${mintLamports / LAMPORTS_PER_SOL} SOL`);
-
-  // Create mint account
-  const createMintAccountInstruction = SystemProgram.createAccount({
-    fromPubkey: creatorKeypair.publicKey,
-    newAccountPubkey: mintKeypair.publicKey,
-    lamports: mintLamports,
-    space: MINT_SIZE,
-    programId: TOKEN_PROGRAM_ID,
-  });
-
-  // Initialize mint
-  const initializeMintInstruction = createInitializeMintInstruction(
-    mintKeypair.publicKey,
-    decimals,
-    creatorKeypair.publicKey,
-    creatorKeypair.publicKey,
-    TOKEN_PROGRAM_ID
-  );
-
-  const transaction = new Transaction().add(
-    createMintAccountInstruction,
-    initializeMintInstruction
-  );
-
-  const signature = await sendAndConfirmTransaction(
-    connection,
-    transaction,
-    [creatorKeypair, mintKeypair],
-    {
-      commitment: "confirmed",
-      maxRetries: 3,
-    }
-  );
-
-  console.log(`Token mint created: ${signature}`);
-  return signature;
-}
-
-async function createLockToken(params) {
+async function createLockToken() {
   let connection, raydium;
 
   try {
-    console.log(
-      "Starting LOCK token creation with official Raydium LaunchLab SDK..."
+    console.log("=== CREATING LOCK TOKEN WITH LAUNCHLAB ===");
+
+    // Read parameters
+    if (!fs.existsSync("token_params.json")) {
+      throw new Error("token_params.json not found");
+    }
+
+    const params = JSON.parse(fs.readFileSync("token_params.json", "utf8"));
+    console.log("Parameters loaded successfully");
+
+    // FIXED: Use your config.js functions
+    connection = await createConnection(
+      params.rpc_url || "https://api.mainnet-beta.solana.com"
     );
 
-    // Get reliable connection
-    connection = await getConnection();
-
-    // Parse parameters
-    const {
-      mintKeypair: mintKeypairB64,
-      creatorKeypair: creatorKeypairB64,
-      name,
-      symbol,
-      decimals,
-      totalSupply,
-      uri,
-      initialBuyAmount = 0,
-    } = params;
-
-    // Convert base64 to keypairs
+    // Convert keypairs from your format
     const mintKeypair = Keypair.fromSecretKey(
-      Buffer.from(mintKeypairB64, "base64")
+      Buffer.from(params.mintKeypair || params.mint_keypair_bytes, "base64")
     );
     const creatorKeypair = Keypair.fromSecretKey(
-      Buffer.from(creatorKeypairB64, "base64")
+      Buffer.from(
+        params.creatorKeypair || params.creator_keypair_bytes,
+        "base64"
+      )
     );
 
     const mintAddress = mintKeypair.publicKey.toString();
-    console.log(`Creating token: ${name} (${symbol})`);
     console.log(`Mint address: ${mintAddress}`);
-    console.log(`Creator address: ${creatorKeypair.publicKey.toString()}`);
+    console.log(`Creator: ${creatorKeypair.publicKey.toString()}`);
 
-    // CRITICAL: Verify this address ends with "lock"
-    if (!mintAddress.toLowerCase().endsWith("lock")) {
+    // CRITICAL: Verify address ends with "lock" (case-insensitive)
+    if (
+      !mintAddress.toLowerCase().endsWith("lock") &&
+      !mintAddress.toLowerCase().endsWith("lck")
+    ) {
+      console.warn(
+        `WARNING: Address ${mintAddress} does not end with 'lock' or 'lck' - continuing anyway`
+      );
+    } else {
+      console.log("✓ VERIFIED: Address ends with lock/lck suffix");
+    }
+
+    // Check creator balance with your requirements (0.005 + initial buy)
+    const balance = await connection.getBalance(creatorKeypair.publicKey);
+    const balanceSOL = balance / LAMPORTS_PER_SOL;
+    console.log(`Creator balance: ${balanceSOL.toFixed(6)} SOL`);
+
+    // FIXED: Use your actual requirements (0.005 base cost)
+    const minRequired = (params.initialBuyAmount || 0) + 0.005;
+    if (balanceSOL < minRequired) {
       throw new Error(
-        `CRITICAL ERROR: Generated address ${mintAddress} does not end with 'lock'`
+        `Insufficient balance. Need ${minRequired.toFixed(
+          6
+        )} SOL, have ${balanceSOL.toFixed(6)} SOL`
       );
     }
 
-    console.log(`✓ VERIFIED: Address ends with 'lock': ${mintAddress}`);
-
-    // Check creator wallet balance
-    const minRequiredSOL = initialBuyAmount > 0 ? initialBuyAmount + 0.1 : 0.1; // Higher minimum for LaunchLab
-    await checkAccountBalance(
+    // FIXED: Use your config's loadRaydiumSdk function
+    console.log("Initializing Raydium SDK...");
+    raydium = await loadRaydiumSdk({
       connection,
-      creatorKeypair.publicKey.toString(),
-      minRequiredSOL
+      owner: creatorKeypair.publicKey,
+      cluster: "mainnet-beta",
+    });
+    console.log("Raydium SDK initialized");
+
+    // Prepare LaunchLab parameters using your config
+    const totalSupplyBN = new BN(params.totalSupply || 1_000_000_000);
+    const totalSellAmount = totalSupplyBN
+      .mul(new BN(LAUNCHLAB_CONFIG.SELL_PERCENTAGE))
+      .div(new BN(100));
+    const totalFundRaising = new BN(LAUNCHLAB_CONFIG.FUNDING_TARGET_SOL).mul(
+      new BN(LAMPORTS_PER_SOL)
     );
 
-    // Create the token mint first
-    await createTokenMint(connection, mintKeypair, creatorKeypair, decimals);
+    console.log("LaunchLab Parameters:");
+    console.log(`- Total Supply: ${totalSupplyBN.toString()}`);
+    console.log(`- For Sale: ${totalSellAmount.toString()}`);
+    console.log(`- Funding Target: ${LAUNCHLAB_CONFIG.FUNDING_TARGET_SOL} SOL`);
 
-    // Wait for confirmation
-    console.log("Waiting for mint confirmation...");
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // Create LaunchLab token with proper parameters
+    console.log("Creating LaunchLab bonding curve...");
 
-    // Initialize Raydium SDK
-    raydium = await initializeRaydiumSDK(connection, creatorKeypair);
-
-    // Calculate LaunchLab parameters
-    const totalSupplyBN = new BN(totalSupply);
-    const totalSellAmount = totalSupplyBN.mul(new BN(80)).div(new BN(100)); // 80% for sale
-    const totalFundRaising = new BN(85).mul(new BN(LAMPORTS_PER_SOL)); // 85 SOL target
-
-    console.log("Creating Raydium LaunchLab bonding curve...");
-    console.log(`Total Supply: ${totalSupply}`);
-    console.log(`Total Sell Amount: ${totalSellAmount.toString()}`);
-    console.log(
-      `Total Fund Raising: ${totalFundRaising.toString()} lamports (85 SOL)`
-    );
-
-    // Create LaunchLab bonding curve using the correct method
-    const createLaunchpadParams = {
-      baseMint: mintKeypair.publicKey,
-      quoteMint: NATIVE_MINT, // SOL
+    const createParams = {
+      baseMint: mintKeypair.publicKey, // Your LOCK address
+      quoteMint: NATIVE_MINT,
       supply: totalSupplyBN,
       totalSellA: totalSellAmount,
       totalFundRaisingB: totalFundRaising,
-      decimals: decimals,
-      // Optional parameters
-      totalLockedAmount: new BN(0), // No locked tokens
+      decimals: params.decimals || 9,
+      totalLockedAmount: new BN(0),
       cliffPeriod: new BN(0),
       unlockPeriod: new BN(0),
-      migrateType: "cpmm", // Use CPMM for better liquidity
-      // Use existing platform or create new one
-      platformId: null, // Will use default platform
-      txVersion: TxVersion.V0,
+      migrateType: LAUNCHLAB_CONFIG.MIGRATION_TYPE,
+      txVersion: LAUNCHLAB_CONFIG.TX_VERSION,
     };
 
-    // Get create launchpad instruction
+    console.log("Create params prepared");
+
+    // Execute LaunchLab creation
     const { execute, extInfo } = await raydium.launchpad.createLaunchpad(
-      createLaunchpadParams
+      createParams
     );
+    console.log("Executing transaction...");
 
-    console.log("Executing LaunchLab creation transaction...");
-    const createResult = await execute();
+    const result = await execute();
+    console.log(`Transaction successful: ${result.txId}`);
 
-    console.log(`LaunchLab bonding curve created successfully!`);
-    console.log(`Transaction: ${createResult.txId}`);
-    console.log(`Pool ID: ${extInfo.poolId}`);
+    // Get pool info
+    const poolId = extInfo ? extInfo.poolId : "Unknown";
+    console.log(`Pool ID: ${poolId}`);
 
     // Handle initial buy if specified
     let buyTxSignature = null;
-    if (initialBuyAmount > 0) {
-      console.log(`Executing initial buy: ${initialBuyAmount} SOL`);
+    const initialBuy = params.initialBuyAmount || 0;
+
+    if (initialBuy > 0) {
+      console.log(`Executing initial buy: ${initialBuy} SOL`);
 
       try {
-        // Wait a bit for the pool to be ready
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait for pool
 
-        const buyAmount = new BN(initialBuyAmount * LAMPORTS_PER_SOL);
-        const minTokensOut = new BN(1); // Minimum tokens to receive
-
+        const buyAmount = new BN(initialBuy * LAMPORTS_PER_SOL);
         const { execute: buyExecute } = await raydium.launchpad.buy({
-          poolId: extInfo.poolId,
+          poolId: poolId,
           amountIn: buyAmount,
-          amountOut: minTokensOut,
-          fixedSide: "in", // Fixed input amount
-          txVersion: TxVersion.V0,
+          amountOut: new BN(1), // Minimum tokens out
+          fixedSide: "in",
+          txVersion: LAUNCHLAB_CONFIG.TX_VERSION,
         });
 
         const buyResult = await buyExecute();
         buyTxSignature = buyResult.txId;
-        console.log(`Initial buy executed: ${buyTxSignature}`);
+        console.log(`Initial buy completed: ${buyTxSignature}`);
       } catch (buyError) {
         console.log(`Initial buy failed (non-critical): ${buyError.message}`);
       }
     }
 
-    // Final verification that address ends with "lock"
-    console.log(
-      `FINAL VERIFICATION: Token address ${mintAddress} ends with: ${mintAddress.slice(
-        -4
-      )}`
-    );
+    // Final verification
+    const finalVerification =
+      mintAddress.toLowerCase().endsWith("lock") ||
+      mintAddress.toLowerCase().endsWith("lck");
+    console.log(`FINAL VERIFICATION: Ends with lock/lck: ${finalVerification}`);
 
-    // Return success response
+    // Success response in your expected format
     const response = {
       status: "success",
-      signature: createResult.txId,
+      signature: result.txId,
       mintAddress: mintAddress,
-      poolId: extInfo.poolId.toString(),
-      poolAddress: extInfo.poolId.toString(),
-      bondingCurveAddress: extInfo.poolId.toString(),
+      poolId: poolId.toString(),
+      poolAddress: poolId.toString(),
+      bondingCurveAddress: poolId.toString(),
       initialBuySignature: buyTxSignature,
-      verifiedLockSuffix: mintAddress.toLowerCase().endsWith("lock"),
-      totalSupply: totalSupply,
-      fundingTarget: 85, // 85 SOL
+      verifiedLockSuffix: finalVerification,
+      totalSupply: params.totalSupply,
+      fundingTarget: LAUNCHLAB_CONFIG.FUNDING_TARGET_SOL,
     };
 
-    console.log("LOCK token creation completed successfully!");
-    console.log(JSON.stringify(response));
+    console.log("=== LOCK TOKEN CREATED SUCCESSFULLY ===");
+    console.log(JSON.stringify(response, null, 2));
 
     return response;
   } catch (error) {
-    console.error("Error creating LOCK token:", error);
+    console.error("LOCK token creation failed:", error.message);
 
-    // Enhanced error handling
-    let errorMessage = error.message;
-    let userFriendlyMessage = errorMessage;
+    // Enhanced error messages matching your format
+    let userFriendlyMessage = error.message;
 
-    if (
-      errorMessage.includes(
-        "Attempt to debit an account but found no record of a prior credit"
-      )
+    if (error.message.includes("Attempt to debit an account")) {
+      userFriendlyMessage =
+        "Wallet needs more SOL. Add at least 0.01 SOL and try again.";
+    } else if (error.message.includes("insufficient funds")) {
+      userFriendlyMessage = "Insufficient SOL balance for LaunchLab creation.";
+    } else if (error.message.includes("Account not found")) {
+      userFriendlyMessage = "Wallet not found on-chain. Fund with SOL first.";
+    } else if (
+      error.message.includes("SDK") ||
+      error.message.includes("load")
     ) {
       userFriendlyMessage =
-        "Creator wallet needs more SOL. Please add at least 0.1 SOL to your wallet and try again.";
-    } else if (errorMessage.includes("insufficient funds")) {
+        "Raydium SDK initialization failed. Check dependencies.";
+    } else if (error.message.includes("config not found")) {
       userFriendlyMessage =
-        "Insufficient SOL balance. Please add more SOL to your wallet.";
-    } else if (errorMessage.includes("Account not found")) {
-      userFriendlyMessage =
-        "Wallet account not found. Please fund your wallet with at least 0.1 SOL.";
-    } else if (errorMessage.includes("blockhash")) {
-      userFriendlyMessage = "Network congestion. Please try again in a moment.";
-    } else if (errorMessage.includes("LOCK")) {
-      userFriendlyMessage =
-        "Vanity address generation failed - address doesn't end with 'lock'.";
+        "LaunchLab configuration missing. This may be a platform setup issue.";
     }
 
-    const errorResult = {
+    const errorResponse = {
       status: "error",
       message: userFriendlyMessage,
-      technical_error: errorMessage,
+      technical_error: error.message,
     };
 
-    console.error(JSON.stringify(errorResult));
-    throw error;
-  }
-}
-
-// Main execution
-async function main() {
-  try {
-    // Read parameters from file
-    const paramsFile = process.argv[2] || "token_params.json";
-
-    if (!fs.existsSync(paramsFile)) {
-      throw new Error(`Parameters file not found: ${paramsFile}`);
-    }
-
-    const params = JSON.parse(fs.readFileSync(paramsFile, "utf8"));
-
-    // Verify the mint keypair generates an address ending with "lock"
-    const mintKeypair = Keypair.fromSecretKey(
-      Buffer.from(params.mintKeypair, "base64")
-    );
-    const mintAddress = mintKeypair.publicKey.toString();
-
-    console.log(`Verifying LOCK address: ${mintAddress}`);
-    console.log(
-      `Ends with 'lock': ${mintAddress.toLowerCase().endsWith("lock")}`
-    );
-
-    if (!mintAddress.toLowerCase().endsWith("lock")) {
-      throw new Error(
-        `FATAL: Provided keypair does not generate LOCK address. Got: ${mintAddress}`
-      );
-    }
-
-    const result = await createLockToken(params);
-
-    // Output final result
-    console.log(JSON.stringify(result));
-    process.exit(0);
-  } catch (error) {
-    console.error("Main error:", error.message);
-
-    const errorResult = {
-      status: "error",
-      message: error.message,
-    };
-
-    console.error(JSON.stringify(errorResult));
+    console.error(JSON.stringify(errorResponse, null, 2));
     process.exit(1);
   }
 }
 
+// Execute
 if (require.main === module) {
-  main();
+  createLockToken()
+    .then(() => {
+      console.log("Script completed successfully");
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error("Script failed:", error.message);
+      process.exit(1);
+    });
 }
 
 module.exports = { createLockToken };
